@@ -1,0 +1,102 @@
+port: 7890
+socks-port: 7891
+mixed-port: 7897
+mode: rule
+unified-delay: true
+keep-alive-interval: 15
+log-level: info
+allow-lan: false
+external-controller: 127.0.0.1:9097
+
+dns:
+  enable: true
+  ipv6: false
+  enhanced-mode: fake-ip
+  fake-ip-range: 198.18.0.1/16
+  respect-rules: true
+  nameserver:
+    - 223.5.5.5
+    - 119.29.29.29
+  proxy-server-nameserver:
+    - 223.5.5.5
+    - 119.29.29.29
+  nameserver-policy:
+    "geosite:cn":
+      - 223.5.5.5
+      - 119.29.29.29
+    "geosite:geolocation-!cn":
+      - "https://1.1.1.1/dns-query"
+      - "https://dns.google/dns-query"
+  fallback:
+    - "https://1.1.1.1/dns-query"
+    - "https://dns.google/dns-query"
+  fallback-filter:
+    geoip: true
+    geoip-code: CN
+    ipcidr:
+      - 240.0.0.0/4
+
+tun:
+  enable: true
+  stack: mixed
+  dns-hijack:
+    - "any:53"
+    - "tcp://any:53"
+  auto-route: true
+  auto-detect-interface: true
+
+proxies:
+  - name: "{{NODE_NAME}}"
+    type: vless
+    server: {{SERVER_IP}}
+    port: {{PORT}}
+    uuid: {{UUID}}
+    network: tcp
+    udp: true
+    tls: true
+    flow: {{FLOW}}
+    servername: {{SNI}}
+    reality-opts:
+      public-key: {{PUBLIC_KEY}}
+      short-id: {{SHORT_ID}}
+    client-fingerprint: {{FINGERPRINT}}
+
+proxy-groups:
+  - name: "🚀 独享-AI与代码"
+    type: select
+    proxies:
+      - "{{NODE_NAME}}"
+      - DIRECT
+
+  - name: "🌐 谷歌与Gemini"
+    type: select
+    proxies:
+      - "{{NODE_NAME}}"
+      - DIRECT
+
+  - name: "🐟 漏网之鱼"
+    type: select
+    proxies:
+      - "{{NODE_NAME}}"
+      - DIRECT
+
+rules:
+  - DOMAIN-SUFFIX,anthropic.com,🚀 独享-AI与代码
+  - DOMAIN-SUFFIX,claude.ai,🚀 独享-AI与代码
+  - DOMAIN-KEYWORD,anthropic,🚀 独享-AI与代码
+  - DOMAIN-KEYWORD,claude,🚀 独享-AI与代码
+  - DOMAIN-SUFFIX,openai.com,🚀 独享-AI与代码
+  - DOMAIN-SUFFIX,chatgpt.com,🚀 独享-AI与代码
+  - DOMAIN-SUFFIX,oaistatic.com,🚀 独享-AI与代码
+  - DOMAIN-SUFFIX,oaiusercontent.com,🚀 独享-AI与代码
+  - DOMAIN-SUFFIX,gemini.google.com,🌐 谷歌与Gemini
+  - DOMAIN-SUFFIX,aistudio.google.com,🌐 谷歌与Gemini
+  - DOMAIN-SUFFIX,generativelanguage.googleapis.com,🌐 谷歌与Gemini
+  - GEOSITE,google,🌐 谷歌与Gemini
+  - GEOIP,google,🌐 谷歌与Gemini
+  - DOMAIN-SUFFIX,github.com,🚀 独享-AI与代码
+  - DOMAIN-SUFFIX,cursor.com,🚀 独享-AI与代码
+  - GEOIP,lan,DIRECT,no-resolve
+  - GEOSITE,cn,DIRECT
+  - GEOIP,cn,DIRECT
+  - MATCH,🐟 漏网之鱼

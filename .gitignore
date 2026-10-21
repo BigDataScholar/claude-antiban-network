@@ -1,0 +1,16 @@
+# Python cache
+__pycache__/
+*.py[cod]
+*$py.class
+.pytest_cache/
+
+# Sensitive or generated client configurations
+*.yaml
+*.yml
+!templates/*.yaml.template
+*.json
+!templates/*.json.template
+
+# OS files
+.DS_Store
+Thumbs.db
