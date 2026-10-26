@@ -2,7 +2,7 @@
 name: claude-antiban-network
 description: >-
   用于引导用户或自动化将新购买的海外原生住宅/双ISP VPS（如 LisaHost、搬瓦工等）搭建为防 Claude/ChatGPT 封号的高防专属网络环境。
-  覆盖 VPS 服务端 Xray VLESS Reality 搭建、Cloudflare WARP 双轨分流（解锁 Gemini/Google 同时保持 Claude 纯净直连）、Linux 内核 TCP Keepalive 调优（根治长思考流 Broken Pipe）、一键生成本地 Clash Verge/Mihomo 配置文件及 iOS 导入链接、以及全自动 DNS/WebRTC 泄漏与连通性门禁自检。
+  覆盖 VPS 服务端 Xray VLESS Reality 搭建、Cloudflare WARP 双轨分流（解锁 Gemini/Google 同时保持 Claude 纯净直连）、Linux 内核 TCP Keepalive 调优（有效缓解长文本推理断流 Broken Pipe）、一键生成本地 Clash Verge/Mihomo 配置文件及 iOS 导入链接、以及端到端连通性与代理路径防泄漏门禁自检。
 ---
 
 # Claude 防封网络全自动化搭建与加固技能 (claude-antiban-network)
@@ -10,7 +10,7 @@ description: >-
 ## 技能概述
 
 本技能为 AI Agent 提供了端到端的**「Claude 专属防封网络自动化搭建与验证」**能力。
-针对国内用户使用海外 AI 服务时高频遇到的**账号封禁、Gemini 地区限制（"ZZ"代码）、长文本思考掉线（Broken Pipe）、DNS/WebRTC 泄漏**等痛点，提供工业级的标准落地流程。
+针对国内用户使用海外 AI 服务时高频遇到的**账号封禁、Gemini 地区限制（"ZZ"代码）、长文本思考掉线（Broken Pipe）、DNS 泄露**等痛点，提供工业级的标准落地流程。
 
 ### 核心架构：双轨隔离防封体系 (Dual-Track Isolation)
 
@@ -30,8 +30,8 @@ flowchart TD
 
 1. **Claude / OpenAI 独享原生通道**：强制直连 VPS 绑定的纯净原生 IP，不与任何公用代理混跑，建立极高的发卡地信誉；
 2. **Google / Gemini WARP 自动补全**：针对 Google GeoIP 误将新机房识别为国家代码 "ZZ" 的问题，底层无缝路由至 Cloudflare WARP 美区清洁出口，两全其美；
-3. **内核级长连接保活 (TCP Keepalive)**：内核 `tcp_keepalive_time` 缩短为 30s，Xray 闲置断开延长至 1800s，彻底根除 Codex、o1/o3 及 Claude 长时间思考导致的 `Broken pipe (os error 32)`；
-4. **全面阻断泄露向量**：VPS 禁用 IPv6、阻断 UDP 443（QUIC），本地配合 Fake-IP 模式，杜绝国内运营商 DNS 污染与解析泄漏。
+3. **内核级长连接保活 (TCP Keepalive)**：内核 `tcp_keepalive_time` 缩短为 30s，Xray 闲置断开延长至 1800s，通过链路双向保活协同调优，有效防范 Codex、o1/o3 及 Claude 长时间思考无数据包导致的 `Broken pipe (os error 32)`；
+4. **阻断常规泄露向量**：VPS 禁用 IPv6、阻断 UDP 443（QUIC），本地配合 Fake-IP 模式防范国内运营商 DNS 污染与代理通道解析泄漏（注: 浏览器端 WebRTC 仍需配合插件禁用以防本地直连泄露）。
 
 ---
 
@@ -123,9 +123,9 @@ python3 ~/.gemini/config/skills/claude-antiban-network/scripts/generate_clash_co
 
 ---
 
-### 第五步：全自动门禁检测与安全出具
+### 第五步：自动化门禁检测与验收（覆盖代理路径）
 
-在本地通过代理端口执行全自动化验证测试：
+在本地通过代理端口执行自动化验证测试：
 
 ```bash
 python3 ~/.gemini/config/skills/claude-antiban-network/scripts/verify_environment.py --proxy http://127.0.0.1:7897
@@ -134,8 +134,8 @@ python3 ~/.gemini/config/skills/claude-antiban-network/scripts/verify_environmen
 * **检测项覆盖**：
   * **Egress IP & 地理位置**：确认是原生美国（US）IP，无漂移；
   * **Claude / Anthropic 连通性**：确认可无阻碍到达 Cloudflare 美区边缘节点；
-  * **Gemini 地区限制绕过**：确认无 `["ZZ"]` 报错，状态码 HTTP 200；
-  * **防泄漏审计**：确认启用了 Fake-IP 阻断、禁用 IPv6 及 QUIC 屏蔽。
+  * **Gemini 地区限制与网关可达**：确认无 `["ZZ"]` 阻断标识；
+  * **代理路径防泄漏审计**：确认代理上游 DNS 为海外解析器、无国内运营商泄露，且本机无公网 IPv6 直连绕行（注: 浏览器 WebRTC 仍需插件配合阻断）。
 
 ---
 

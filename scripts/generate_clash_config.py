@@ -58,38 +58,38 @@ tun:
   auto-detect-interface: true
 
 proxies:
-  - name: "{node_name}"
+  - name: {node_name_yaml}
     type: vless
-    server: {server_ip}
+    server: {server_ip_yaml}
     port: {port}
-    uuid: {uuid}
+    uuid: {uuid_yaml}
     network: tcp
     udp: true
     tls: true
-    flow: {flow}
-    servername: {sni}
+    flow: {flow_yaml}
+    servername: {sni_yaml}
     reality-opts:
-      public-key: {public_key}
-      short-id: {short_id}
-    client-fingerprint: {fingerprint}
+      public-key: {public_key_yaml}
+      short-id: {short_id_yaml}
+    client-fingerprint: {fingerprint_yaml}
 
 proxy-groups:
   - name: "🚀 独享-AI与代码"
     type: select
     proxies:
-      - "{node_name}"
+      - {node_name_yaml}
       - DIRECT
 
   - name: "🌐 谷歌与Gemini"
     type: select
     proxies:
-      - "{node_name}"
+      - {node_name_yaml}
       - DIRECT
 
   - name: "🐟 漏网之鱼"
     type: select
     proxies:
-      - "{node_name}"
+      - {node_name_yaml}
       - DIRECT
 
 rules:
@@ -199,10 +199,40 @@ def main():
     if output_dir:
         os.makedirs(output_dir, exist_ok=True)
 
-    # Safely format node name for YAML (escaping inner double quotes)
-    escaped_node_name = node_name.replace('"', '\\"')
-
+    # Use standard JSON string dumps for YAML flow scalars.
+    # Standard JSON string literals are fully valid YAML 1.2 double-quoted strings,
+    # correctly handling all backslashes, quotes, octals/integers (like short-id), and control chars.
     node_dict = {
+        "server_ip_yaml": json.dumps(str(server_ip), ensure_ascii=False),
+        "port": int(port),
+        "uuid_yaml": json.dumps(str(uuid), ensure_ascii=False),
+        "flow_yaml": json.dumps(str(flow), ensure_ascii=False),
+        "sni_yaml": json.dumps(str(sni), ensure_ascii=False),
+        "public_key_yaml": json.dumps(str(public_key), ensure_ascii=False),
+        "short_id_yaml": json.dumps(str(short_id), ensure_ascii=False),
+        "fingerprint_yaml": json.dumps(str(fingerprint), ensure_ascii=False),
+        "node_name_yaml": json.dumps(str(node_name), ensure_ascii=False)
+    }
+
+    yaml_content = TEMPLATE_YAML.format(**node_dict)
+
+    # Restrict file permissions to 0600 on creation (owner read/write only) as it contains private proxy credentials
+    flags = os.O_WRONLY | os.O_CREAT | os.O_TRUNC
+    try:
+        fd = os.open(output_path, flags, 0o600)
+        with open(fd, "w", encoding="utf-8") as f:
+            f.write(yaml_content)
+        try:
+            os.chmod(output_path, 0o600)
+        except OSError as e:
+            print(f"[WARN] Unable to enforce 0600 permissions on {output_path}: {e}", file=sys.stderr)
+        print(f"\n[SUCCESS] Generated Clash YAML Profile: {os.path.abspath(output_path)}")
+        print(f"[SECURITY] Set file permissions to 0600: {os.path.abspath(output_path)}")
+    except Exception as e:
+        print(f"\n[ERROR] Failed to write profile to {output_path}: {e}", file=sys.stderr)
+        sys.exit(1)
+
+    vless_node_info = {
         "server_ip": server_ip,
         "port": port,
         "uuid": uuid,
@@ -211,24 +241,10 @@ def main():
         "public_key": public_key,
         "short_id": short_id,
         "fingerprint": fingerprint,
-        "node_name": escaped_node_name
+        "node_name": node_name
     }
+    vless_url = generate_vless_url(vless_node_info)
 
-    yaml_content = TEMPLATE_YAML.format(**node_dict)
-
-    with open(output_path, "w", encoding="utf-8") as f:
-        f.write(yaml_content)
-
-    # Restrict file permissions to 0600 (owner read/write only) as it contains private proxy credentials
-    try:
-        os.chmod(output_path, 0o600)
-    except Exception:
-        pass
-
-    vless_url = generate_vless_url({**node_dict, "node_name": node_name})
-
-    print(f"\n[SUCCESS] Generated Clash YAML Profile: {os.path.abspath(output_path)}")
-    print(f"[SECURITY] Set file permissions to 0600: {os.path.abspath(output_path)}")
     print(f"\n[VLESS Share Link (for iOS Shadowrocket / Sing-box / Loon)]:\n{vless_url}\n")
 
 if __name__ == "__main__":

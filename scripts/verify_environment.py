@@ -58,10 +58,29 @@ def test_dns_leak(proxy_handler):
     try:
         req = urllib.request.Request("https://edns.ip-api.com/json", headers={"User-Agent": "curl/7.88.1"})
         with opener.open(req, timeout=10) as resp:
-            data = json.loads(resp.read().decode())
-            dns_info = data.get("dns", {})
-            dns_ip = dns_info.get("ip", "")
-            dns_geo = dns_info.get("geo", "")
+            raw_body = resp.read().decode()
+            try:
+                data = json.loads(raw_body)
+            except Exception:
+                print(f"[{YELLOW}UNVERIFIED{RESET}] DNS 探针响应非标准 JSON 格式，未能验证解析服务器。")
+                return None
+
+            if not isinstance(data, dict):
+                print(f"[{YELLOW}UNVERIFIED{RESET}] DNS 探针响应结构异常，未能验证解析服务器。")
+                return None
+
+            dns_info = data.get("dns")
+            if not isinstance(dns_info, dict):
+                print(f"[{YELLOW}UNVERIFIED{RESET}] DNS 探针未包含有效的 dns 字段对象，标记为未验证。")
+                print(f"       注意: 本探针仅测试经由代理通道的解析服务器，不代表操作系统全局或浏览器 WebRTC 完全无泄露。")
+                return None
+
+            dns_ip = str(dns_info.get("ip") or "").strip()
+            dns_geo = str(dns_info.get("geo") or "").strip()
+
+            if not dns_ip or not dns_geo:
+                print(f"[{YELLOW}UNVERIFIED{RESET}] DNS 探针返回的 IP 或地理字段为空，无法判定。")
+                return None
 
             if "China" in dns_geo or dns_geo.startswith("CN"):
                 print(f"[{RED}LEAK DETECTED{RESET}] DNS 解析发生泄露!")
@@ -69,7 +88,8 @@ def test_dns_leak(proxy_handler):
                 print(f"       {YELLOW}风险提示: 您的常规未分流域名正被国内运营商 DNS 解析。请确保已在 Clash 启用 Fake-IP 模式并检查 nameserver 规则。{RESET}")
                 return False
             else:
-                print(f"[{GREEN}PASS{RESET}] DNS 解析出口位于海外: {dns_ip} ({dns_geo})")
+                print(f"[{GREEN}PASS{RESET}] 经代理路径解析的 DNS 出口位于海外: {dns_ip} ({dns_geo})")
+                print(f"       说明: 本项仅验证代理通道上游解析器为海外服务器，不替代系统级 WebRTC/Fake-IP 配置审计。")
                 return True
     except Exception as e:
         print(f"[{YELLOW}UNVERIFIED{RESET}] 自动 DNS 泄露探针未能完成 ({e})，标记为未验证。建议人工在 https://ip.net.coffee/claude 中复核。")
@@ -145,10 +165,10 @@ def test_gemini(proxy_handler):
         with opener.open(req, timeout=12) as resp:
             content = resp.read().decode("utf-8", errors="ignore")
             if '["ZZ"]' in content or "not supported in your country" in content.lower():
-                print(f"[{RED}BLOCKED{RESET}] Gemini 区域检测: 失败 (Google GeoIP 标记为国家代码 'ZZ'，未解锁)")
+                print(f"[{RED}BLOCKED{RESET}] Gemini 区域检测: 失败 (检测到区域封锁标识或 ZZ 代码)")
                 return False
             else:
-                print(f"[{GREEN}PASS{RESET}] Google Gemini 区域检测: 成功 (未出现 ZZ 区域封锁)")
+                print(f"[{GREEN}PASS{RESET}] Google Gemini 网关可达 (未出现 ZZ 封锁标识；注: 实际模型交互与登录权限需在浏览器中验证)")
                 return True
     except Exception as e:
         print(f"[{RED}FAIL{RESET}] Gemini 连接异常: {e}")
@@ -164,14 +184,18 @@ def check_local_ipv6_leak():
         local_ipv6 = s.getsockname()[0]
         s.close()
         if not local_ipv6.startswith("fe80:") and not local_ipv6.startswith("::1"):
-            print(f"[{YELLOW}WARN{RESET}] 本机检测到活跃的公网 IPv6 地址: {local_ipv6}")
-            print(f"       建议: 如果客户端代理未开启 IPv6 代理或未禁用 IPv6，可能会导致流量绕过代理发生泄露。")
+            print(f"[{RED}LEAK RISK{RESET}] 本机检测到活跃的公网 IPv6 地址/路由: {local_ipv6}")
+            print(f"       风险提示: 若客户端代理未开启 IPv6 代理或系统未禁用 IPv6，双栈应用可能绕过代理直连国内 IPv6 发生泄露。")
             return False
-    except Exception:
-        # IPv6 socket connect failed, meaning IPv6 is not actively leaking or not routed
-        pass
-    print(f"[{GREEN}PASS{RESET}] 本机 IPv6 泄露检查: 未发现直连绕行")
-    return True
+        print(f"[{GREEN}PASS{RESET}] 本机仅有链路本地 IPv6（未发现公网直连绕行风险）")
+        return True
+    except OSError:
+        # Network unreachable, address not available, etc. -> No active public IPv6 default route
+        print(f"[{GREEN}PASS{RESET}] 本机无公网 IPv6 路由（未发现 IPv6 绕过代理风险）")
+        return True
+    except Exception as e:
+        print(f"[{YELLOW}UNVERIFIED{RESET}] 本机 IPv6 检查异常 ({e})，无法确认 IPv6 路由状态。")
+        return None
 
 def main():
     parser = argparse.ArgumentParser(description="Verify Claude Anti-Ban Network Environment")
@@ -201,22 +225,36 @@ def main():
     # 5. Local IPv6
     ipv6_safe = check_local_ipv6_leak()
 
-    print_header("验收检测结论总结")
-    print(f"  - 出口 IP 归属: {'✓ 通过 (US)' if is_us else '✗ 失败'}")
-    print(f"  - DNS 解析状态: {'✓ 正常 (无国内泄露)' if dns_clean is True else ('✗ 存在泄露' if dns_clean is False else '? 未能自动化复核')}")
-    print(f"  - Anthropic API 网关: {'✓ 可直达' if api_reachable else '✗ 无法连接'}")
-    print(f"  - Claude Web 状态: {web_status}")
-    print(f"  - Gemini 区域解锁: {'✓ 未见 ZZ 封锁' if gemini_ok else '✗ 存在区域限制'}")
-    print(f"  - 本机 IPv6 绕行检查: {'✓ 安全' if ipv6_safe else '⚠ 需注意 IPv6 泄露风险'}")
+    print_header("验收门禁综合判定")
+    gate_checks = [
+        ("出口 IP 归属 (US 纯净独享)", is_us is True, "出口 IP 非美国或未能识别"),
+        ("Anthropic API 网关直达", api_reachable is True, "Anthropic API 边缘网关连接失败"),
+        ("Claude Web 网页端可达", web_status in ["PASS", "CHALLENGE"], f"Claude Web 网页端异常或被完全封锁 (状态: {web_status})"),
+        ("Google Gemini 区域可达", gemini_ok is True, "Google Gemini 提示区域限制或 ZZ 代码"),
+        ("代理上游 DNS 解析无泄露", dns_clean is True, "DNS 解析未完成验证或检测到国内运营商泄露"),
+        ("本机 IPv6 隔离安全", ipv6_safe is True, "检测到活跃公网 IPv6 路由或未能确认 IPv6 隔离")
+    ]
+
+    all_passed = True
+    for name, passed, fail_reason in gate_checks:
+        if passed:
+            print(f"  [{GREEN}PASS{RESET}] {name}")
+        else:
+            all_passed = False
+            print(f"  [{RED}FAIL{RESET}] {name} -> {fail_reason}")
 
     print("\n[人工审计与日常防封指引 (Manual Audit Tips)]:")
-    print("1. WebRTC 防护: 代理无法彻底关闭浏览器内部 WebRTC。请在 Chrome/Edge 中安装 'WebRTC Control' 插件并开启禁用。")
+    print("1. WebRTC 防护: 本探针仅测试代理路径。请在 Chrome/Edge 中安装 'WebRTC Control' 插件并开启禁用，防止浏览器 WebRTC 暴露本地 IP。")
     print("2. 欺诈分复核: 建议在权威数据库 https://scamalytics.com 中输入你的出口 IP 进行人工复核（低于 25 分为安全）。")
     print("3. 稳定使用原则: 会话期间请勿频繁变动网络或切换节点。")
     print("=====================================================\n")
 
-    overall_pass = is_us and api_reachable and gemini_ok and (dns_clean is not False)
-    sys.exit(0 if overall_pass else 1)
+    if all_passed:
+        print(f"{BOLD}{GREEN}[GATE: PASS] 全部 6 项网络隔离与连通性门禁检测均已通过！{RESET}\n")
+        sys.exit(0)
+    else:
+        print(f"{BOLD}{RED}[GATE: FAIL] 门禁检测未全部达标，拒绝盲目验收通过！{RESET}\n")
+        sys.exit(1)
 
 if __name__ == "__main__":
     main()

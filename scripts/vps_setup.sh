@@ -11,9 +11,9 @@
 
 set -euo pipefail
 
-# Default Parameters
-PORT="${PORT:-24433}"
-SNI="${SNI:-gateway.icloud.com}"
+# User-supplied or environment parameters (empty if not specified)
+PORT_INPUT="${PORT:-}"
+SNI_INPUT="${SNI:-}"
 WARP_PORT="40000"
 REGENERATE="${REGENERATE:-false}"
 
@@ -50,30 +50,49 @@ if [ ! -f /usr/local/bin/xray ]; then
 fi
 
 # ------------------------------------------------------------------------------
-# 3. Generate or Reuse Reality Keys and Credentials
+# 3. Generate or Reuse Reality Keys and Configuration Parameters
 # ------------------------------------------------------------------------------
-log_info "Step 3: Configuring VLESS Reality credentials..."
+log_info "Step 3: Configuring VLESS Reality credentials and ports..."
 
 EXISTING_CONFIG="/usr/local/etc/xray/config.json"
 UUID=""
 PRIVATE_KEY=""
 PUBLIC_KEY=""
 SHORT_ID=""
+PORT=""
+SNI=""
 
-# Check if valid existing credentials can be reused
+# Check if valid existing credentials and custom parameters can be reused
 if [ "$REGENERATE" != "true" ] && [ -f "$EXISTING_CONFIG" ]; then
-    log_info "Found existing Xray configuration. Checking for reusable credentials..."
+    log_info "Found existing Xray configuration. Checking for reusable parameters..."
+    EXISTING_PORT=$(jq -r '.inbounds[0].port // empty' "$EXISTING_CONFIG" 2>/dev/null || true)
+    EXISTING_SNI=$(jq -r '.inbounds[0].streamSettings.realitySettings.serverNames[0] // empty' "$EXISTING_CONFIG" 2>/dev/null || true)
     UUID=$(jq -r '.inbounds[0].settings.clients[0].id // empty' "$EXISTING_CONFIG" 2>/dev/null || true)
     PRIVATE_KEY=$(jq -r '.inbounds[0].streamSettings.realitySettings.privateKey // empty' "$EXISTING_CONFIG" 2>/dev/null || true)
     SHORT_ID=$(jq -r '.inbounds[0].streamSettings.realitySettings.shortIds[0] // empty' "$EXISTING_CONFIG" 2>/dev/null || true)
     
+    # Preserve existing port if user didn't explicitly override it
+    if [ -n "$EXISTING_PORT" ] && [ -z "$PORT_INPUT" ]; then
+        PORT="$EXISTING_PORT"
+        log_info "Preserving existing listening port: ${PORT}"
+    fi
+    # Preserve existing SNI if user didn't explicitly override it
+    if [ -n "$EXISTING_SNI" ] && [ -z "$SNI_INPUT" ]; then
+        SNI="$EXISTING_SNI"
+        log_info "Preserving existing SNI: ${SNI}"
+    fi
+
     if [ -n "$PRIVATE_KEY" ]; then
         # Derive Public Key from Private Key using Xray
-        # In newer Xray versions, xray x25519 -i <privkey> outputs Password (PublicKey): <pubkey>
+        # In modern Xray versions, xray x25519 -i <privkey> outputs Password (PublicKey): <pubkey>
         DERIVED_OUT=$(/usr/local/bin/xray x25519 -i "$PRIVATE_KEY" 2>/dev/null || true)
         PUBLIC_KEY=$(echo "$DERIVED_OUT" | grep -iE "(public key|publickey|password)" | awk -F': ' '{print $2}' | tr -d ' \r\n' || true)
     fi
 fi
+
+# Fallback to defaults or user inputs if not preserved
+PORT="${PORT:-${PORT_INPUT:-24433}}"
+SNI="${SNI:-${SNI_INPUT:-gateway.icloud.com}}"
 
 # Generate fresh credentials if not found or regeneration requested
 if [ -z "$UUID" ] || [ -z "$PRIVATE_KEY" ] || [ -z "$PUBLIC_KEY" ] || [ -z "$SHORT_ID" ]; then
@@ -160,28 +179,30 @@ if command -v warp-cli &> /dev/null; then
     done
 fi
 
+GOOGLE_OUTBOUND="warp"
 if [ "$WARP_READY" != "true" ]; then
-    log_warn "WARP proxy on 127.0.0.1:${WARP_PORT} is not ready yet or package failed to install."
-    log_warn "Google/Gemini traffic will fall back or wait for WARP daemon initialization."
+    GOOGLE_OUTBOUND="direct"
+    log_warn "====================================================================="
+    log_warn "[WARNING] Cloudflare WARP proxy on 127.0.0.1:${WARP_PORT} is not ready or failed to install."
+    log_warn "To prevent blackholing traffic, Google/Gemini routing has fallen back to DIRECT (Native IP)."
+    log_warn "Claude and OpenAI will work normally on Native IP. Gemini may face ZZ geo-block until WARP is active."
+    log_warn "====================================================================="
+else
+    log_info "Cloudflare WARP proxy verified active on 127.0.0.1:${WARP_PORT} (Dual-track routing enabled)."
 fi
 
 # Detect Public IPv4
 SERVER_IP=$(curl -s -4 -m 5 https://api.ipify.org || curl -s -4 -m 5 https://ipinfo.io/ip || curl -s -4 -m 5 https://icanhazip.com || echo "YOUR_VPS_IP")
 
 # ------------------------------------------------------------------------------
-# 6. Write Xray Configuration (/usr/local/etc/xray/config.json)
+# 6. Write, Validate and Deploy Xray Configuration
 # ------------------------------------------------------------------------------
-log_info "Step 6: Writing Xray server configuration with dual-track routing..."
+log_info "Step 6: Generating and validating Xray server configuration..."
 
 mkdir -p /usr/local/etc/xray/
+TMP_CONFIG="/usr/local/etc/xray/config.json.tmp.$$"
 
-if [ -f "$EXISTING_CONFIG" ]; then
-    BACKUP_PATH="/usr/local/etc/xray/config.json.bak.$(date +%s)"
-    cp "$EXISTING_CONFIG" "$BACKUP_PATH"
-    log_info "Existing configuration backed up to ${BACKUP_PATH}"
-fi
-
-cat > /usr/local/etc/xray/config.json << EOF
+cat > "$TMP_CONFIG" << EOF
 {
   "log": {
     "loglevel": "warning"
@@ -299,14 +320,14 @@ cat > /usr/local/etc/xray/config.json << EOF
           "domain:aistudio.google.com",
           "domain:generativelanguage.googleapis.com"
         ],
-        "outboundTag": "warp"
+        "outboundTag": "${GOOGLE_OUTBOUND}"
       },
       {
         "type": "field",
         "ip": [
           "geoip:google"
         ],
-        "outboundTag": "warp"
+        "outboundTag": "${GOOGLE_OUTBOUND}"
       },
       {
         "type": "field",
@@ -318,17 +339,49 @@ cat > /usr/local/etc/xray/config.json << EOF
 }
 EOF
 
-# Restart Xray
+# Configuration Pre-flight Validation
+log_info "Testing generated configuration syntax with Xray..."
+if ! /usr/local/bin/xray run -test -conf "$TMP_CONFIG" >/dev/null 2>&1 && ! /usr/local/bin/xray -test -config "$TMP_CONFIG" >/dev/null 2>&1; then
+    log_error "Configuration syntax validation FAILED! Aborting update to protect running service."
+    /usr/local/bin/xray run -test -conf "$TMP_CONFIG" || /usr/local/bin/xray -test -config "$TMP_CONFIG" || true
+    rm -f "$TMP_CONFIG"
+    exit 1
+fi
+log_info "Configuration validation passed."
+
+# Backup existing configuration
+BACKUP_PATH=""
+if [ -f "$EXISTING_CONFIG" ]; then
+    BACKUP_PATH="/usr/local/etc/xray/config.json.bak.$(date +%s)"
+    cp "$EXISTING_CONFIG" "$BACKUP_PATH"
+    log_info "Existing configuration backed up to ${BACKUP_PATH}"
+fi
+
+# Atomic replacement
+mv "$TMP_CONFIG" "$EXISTING_CONFIG"
+
+# Restart Xray with Rollback Protection
+log_info "Restarting Xray service..."
 systemctl enable xray >/dev/null 2>&1 || true
-systemctl restart xray
+systemctl restart xray || true
 
 # Verify Xray is running
 sleep 2
 if systemctl is-active --quiet xray; then
     log_info "Xray service successfully started and active!"
 else
-    log_error "Xray failed to start! Checking logs..."
-    journalctl -u xray -n 20 --no-pager
+    log_error "Xray service failed to start after applying new configuration!"
+    journalctl -u xray -n 25 --no-pager || true
+    if [ -n "$BACKUP_PATH" ] && [ -f "$BACKUP_PATH" ]; then
+        log_warn "Initiating automatic rollback to previous configuration: ${BACKUP_PATH}..."
+        cp "$BACKUP_PATH" "$EXISTING_CONFIG"
+        systemctl restart xray || true
+        if systemctl is-active --quiet xray; then
+            log_info "Rollback SUCCESSFUL! Previous running service has been restored."
+        else
+            log_error "Rollback failed. Please check Xray systemd logs manually."
+        fi
+    fi
     exit 1
 fi
 
@@ -361,7 +414,8 @@ cat << JSON_OUTPUT
   "short_id": "${SHORT_ID}",
   "fingerprint": "chrome",
   "warp_port": ${WARP_PORT},
-  "warp_ready": ${WARP_READY}
+  "warp_ready": ${WARP_READY},
+  "google_outbound": "${GOOGLE_OUTBOUND}"
 }
 ###JSON_OUTPUT_END###
 JSON_OUTPUT
