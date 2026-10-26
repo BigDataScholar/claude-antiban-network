@@ -1,6 +1,6 @@
 # Claude Anti-Ban Network (Claude 专属防封网络搭建技能套件)
 
-> 🛡️ **专为海外 AI（Claude 3.7 / ChatGPT o1 & o3 / Google Gemini）打造的工业级防封专属代理网络自动化构建套件。**
+> 🛡️ **专为海外 AI（Claude / ChatGPT / Gemini）打造的工业级防封专属代理网络自动化构建套件。**
 > 支持自动化在全新海外 VPS（如 LisaHost 美区 9929 双 ISP 原生住宅 VPS、搬瓦工等）上一键部署与本地客户端加固。
 
 ---
