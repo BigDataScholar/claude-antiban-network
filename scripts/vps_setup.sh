@@ -62,6 +62,8 @@ SHORT_ID=""
 PORT=""
 SNI=""
 EXISTING_CLIENTS=""
+EXISTING_SHORT_IDS=""
+EXTRA_INBOUNDS=""
 
 # Check if valid existing credentials and custom parameters can be reused
 if [ "$REGENERATE" != "true" ] && [ -f "$EXISTING_CONFIG" ]; then
@@ -69,6 +71,8 @@ if [ "$REGENERATE" != "true" ] && [ -f "$EXISTING_CONFIG" ]; then
     EXISTING_PORT=$(jq -r '.inbounds[0].port // empty' "$EXISTING_CONFIG" 2>/dev/null || true)
     EXISTING_SNI=$(jq -r '.inbounds[0].streamSettings.realitySettings.serverNames[0] // empty' "$EXISTING_CONFIG" 2>/dev/null || true)
     EXISTING_CLIENTS=$(jq -c '.inbounds[0].settings.clients // empty' "$EXISTING_CONFIG" 2>/dev/null || true)
+    EXISTING_SHORT_IDS=$(jq -c '.inbounds[0].streamSettings.realitySettings.shortIds // empty' "$EXISTING_CONFIG" 2>/dev/null || true)
+    EXTRA_INBOUNDS=$(jq -c '.inbounds[1:] // empty' "$EXISTING_CONFIG" 2>/dev/null || true)
     UUID=$(jq -r '.inbounds[0].settings.clients[0].id // empty' "$EXISTING_CONFIG" 2>/dev/null || true)
     PRIVATE_KEY=$(jq -r '.inbounds[0].streamSettings.realitySettings.privateKey // empty' "$EXISTING_CONFIG" 2>/dev/null || true)
     SHORT_ID=$(jq -r '.inbounds[0].streamSettings.realitySettings.shortIds[0] // empty' "$EXISTING_CONFIG" 2>/dev/null || true)
@@ -203,10 +207,25 @@ log_info "Step 6: Generating and validating Xray server configuration..."
 
 mkdir -p /usr/local/etc/xray/
 TMP_CONFIG="/usr/local/etc/xray/config.tmp.$$.json"
-if [ -n "$EXISTING_CLIENTS" ]; then
+
+if [ -n "$EXISTING_CLIENTS" ] && [ "$EXISTING_CLIENTS" != "null" ]; then
     CLIENTS_JSON="$EXISTING_CLIENTS"
 else
     CLIENTS_JSON="[{\"id\": \"${UUID}\", \"flow\": \"xtls-rprx-vision\"}]"
+fi
+
+if [ -n "$EXISTING_SHORT_IDS" ] && [ "$EXISTING_SHORT_IDS" != "null" ]; then
+    SHORT_IDS_JSON="$EXISTING_SHORT_IDS"
+else
+    SHORT_IDS_JSON="[\"${SHORT_ID}\"]"
+fi
+
+EXTRA_INBOUNDS_SNIPPET=""
+if [ -n "$EXTRA_INBOUNDS" ] && [ "$EXTRA_INBOUNDS" != "[]" ] && [ "$EXTRA_INBOUNDS" != "null" ]; then
+    STRIPPED=$(echo "$EXTRA_INBOUNDS" | sed -e 's/^[[:space:]]*\[//' -e 's/\][[:space:]]*$//')
+    if [ -n "$STRIPPED" ]; then
+        EXTRA_INBOUNDS_SNIPPET=", ${STRIPPED}"
+    fi
 fi
 
 cat > "$TMP_CONFIG" << EOF
@@ -246,9 +265,7 @@ cat > "$TMP_CONFIG" << EOF
             "${SNI}"
           ],
           "privateKey": "${PRIVATE_KEY}",
-          "shortIds": [
-            "${SHORT_ID}"
-          ]
+          "shortIds": ${SHORT_IDS_JSON}
         }
       },
       "sniffing": {
@@ -258,7 +275,7 @@ cat > "$TMP_CONFIG" << EOF
           "tls"
         ]
       }
-    }
+    }${EXTRA_INBOUNDS_SNIPPET}
   ],
   "outbounds": [
     {
