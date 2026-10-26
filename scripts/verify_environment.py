@@ -10,6 +10,8 @@ Tests:
 """
 
 import argparse
+import errno
+import ipaddress
 import json
 import socket
 import sys
@@ -75,11 +77,27 @@ def test_dns_leak(proxy_handler):
                 print(f"       注意: 本探针仅测试经由代理通道的解析服务器，不代表操作系统全局或浏览器 WebRTC 完全无泄露。")
                 return None
 
-            dns_ip = str(dns_info.get("ip") or "").strip()
-            dns_geo = str(dns_info.get("geo") or "").strip()
+            raw_ip = dns_info.get("ip")
+            raw_geo = dns_info.get("geo")
+            if not isinstance(raw_ip, str) or not isinstance(raw_geo, str):
+                print(f"[{YELLOW}UNVERIFIED{RESET}] DNS 探针返回的数据类型异常，无法判定。")
+                return None
+
+            dns_ip = raw_ip.strip()
+            dns_geo = raw_geo.strip()
 
             if not dns_ip or not dns_geo:
                 print(f"[{YELLOW}UNVERIFIED{RESET}] DNS 探针返回的 IP 或地理字段为空，无法判定。")
+                return None
+
+            try:
+                ipaddress.ip_address(dns_ip)
+            except ValueError:
+                print(f"[{YELLOW}UNVERIFIED{RESET}] DNS 探针返回的 IP 格式无效 ({dns_ip})，无法判定。")
+                return None
+
+            if dns_geo.lower() in ["unknown", "undefined", "none"]:
+                print(f"[{YELLOW}UNVERIFIED{RESET}] DNS 探针返回未知的地理归属 ({dns_geo})，无法判定。")
                 return None
 
             if "China" in dns_geo or dns_geo.startswith("CN"):
@@ -189,10 +207,12 @@ def check_local_ipv6_leak():
             return False
         print(f"[{GREEN}PASS{RESET}] 本机仅有链路本地 IPv6（未发现公网直连绕行风险）")
         return True
-    except OSError:
-        # Network unreachable, address not available, etc. -> No active public IPv6 default route
-        print(f"[{GREEN}PASS{RESET}] 本机无公网 IPv6 路由（未发现 IPv6 绕过代理风险）")
-        return True
+    except OSError as e:
+        if e.errno in (errno.ENETUNREACH, errno.EADDRNOTAVAIL, errno.EHOSTUNREACH):
+            print(f"[{GREEN}PASS{RESET}] 本机无公网 IPv6 路由（未发现 IPv6 绕过代理风险）")
+            return True
+        print(f"[{YELLOW}UNVERIFIED{RESET}] 本机 IPv6 检查异常 (errno={e.errno}: {e})，无法确认 IPv6 路由状态。")
+        return None
     except Exception as e:
         print(f"[{YELLOW}UNVERIFIED{RESET}] 本机 IPv6 检查异常 ({e})，无法确认 IPv6 路由状态。")
         return None
@@ -229,7 +249,7 @@ def main():
     gate_checks = [
         ("出口 IP 归属 (US 纯净独享)", is_us is True, "出口 IP 非美国或未能识别"),
         ("Anthropic API 网关直达", api_reachable is True, "Anthropic API 边缘网关连接失败"),
-        ("Claude Web 网页端可达", web_status in ["PASS", "CHALLENGE"], f"Claude Web 网页端异常或被完全封锁 (状态: {web_status})"),
+        ("Claude Web 网页端直达", web_status == "PASS", f"Claude Web 网页端未达直达状态 (当前状态: {web_status})"),
         ("Google Gemini 区域可达", gemini_ok is True, "Google Gemini 提示区域限制或 ZZ 代码"),
         ("代理上游 DNS 解析无泄露", dns_clean is True, "DNS 解析未完成验证或检测到国内运营商泄露"),
         ("本机 IPv6 隔离安全", ipv6_safe is True, "检测到活跃公网 IPv6 路由或未能确认 IPv6 隔离")

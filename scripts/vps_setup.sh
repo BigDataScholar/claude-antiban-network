@@ -61,12 +61,14 @@ PUBLIC_KEY=""
 SHORT_ID=""
 PORT=""
 SNI=""
+EXISTING_CLIENTS=""
 
 # Check if valid existing credentials and custom parameters can be reused
 if [ "$REGENERATE" != "true" ] && [ -f "$EXISTING_CONFIG" ]; then
     log_info "Found existing Xray configuration. Checking for reusable parameters..."
     EXISTING_PORT=$(jq -r '.inbounds[0].port // empty' "$EXISTING_CONFIG" 2>/dev/null || true)
     EXISTING_SNI=$(jq -r '.inbounds[0].streamSettings.realitySettings.serverNames[0] // empty' "$EXISTING_CONFIG" 2>/dev/null || true)
+    EXISTING_CLIENTS=$(jq -c '.inbounds[0].settings.clients // empty' "$EXISTING_CONFIG" 2>/dev/null || true)
     UUID=$(jq -r '.inbounds[0].settings.clients[0].id // empty' "$EXISTING_CONFIG" 2>/dev/null || true)
     PRIVATE_KEY=$(jq -r '.inbounds[0].streamSettings.realitySettings.privateKey // empty' "$EXISTING_CONFIG" 2>/dev/null || true)
     SHORT_ID=$(jq -r '.inbounds[0].streamSettings.realitySettings.shortIds[0] // empty' "$EXISTING_CONFIG" 2>/dev/null || true)
@@ -200,7 +202,12 @@ SERVER_IP=$(curl -s -4 -m 5 https://api.ipify.org || curl -s -4 -m 5 https://ipi
 log_info "Step 6: Generating and validating Xray server configuration..."
 
 mkdir -p /usr/local/etc/xray/
-TMP_CONFIG="/usr/local/etc/xray/config.json.tmp.$$"
+TMP_CONFIG="/usr/local/etc/xray/config.tmp.$$.json"
+if [ -n "$EXISTING_CLIENTS" ]; then
+    CLIENTS_JSON="$EXISTING_CLIENTS"
+else
+    CLIENTS_JSON="[{\"id\": \"${UUID}\", \"flow\": \"xtls-rprx-vision\"}]"
+fi
 
 cat > "$TMP_CONFIG" << EOF
 {
@@ -225,12 +232,7 @@ cat > "$TMP_CONFIG" << EOF
       "port": ${PORT},
       "protocol": "vless",
       "settings": {
-        "clients": [
-          {
-            "id": "${UUID}",
-            "flow": "xtls-rprx-vision"
-          }
-        ],
+        "clients": ${CLIENTS_JSON},
         "decryption": "none"
       },
       "streamSettings": {
@@ -341,9 +343,9 @@ EOF
 
 # Configuration Pre-flight Validation
 log_info "Testing generated configuration syntax with Xray..."
-if ! /usr/local/bin/xray run -test -conf "$TMP_CONFIG" >/dev/null 2>&1 && ! /usr/local/bin/xray -test -config "$TMP_CONFIG" >/dev/null 2>&1; then
+if ! /usr/local/bin/xray run -test -config "$TMP_CONFIG" >/dev/null 2>&1 && ! /usr/local/bin/xray -test -config "$TMP_CONFIG" >/dev/null 2>&1; then
     log_error "Configuration syntax validation FAILED! Aborting update to protect running service."
-    /usr/local/bin/xray run -test -conf "$TMP_CONFIG" || /usr/local/bin/xray -test -config "$TMP_CONFIG" || true
+    /usr/local/bin/xray run -test -config "$TMP_CONFIG" || /usr/local/bin/xray -test -config "$TMP_CONFIG" || true
     rm -f "$TMP_CONFIG"
     exit 1
 fi
@@ -363,14 +365,16 @@ mv "$TMP_CONFIG" "$EXISTING_CONFIG"
 # Restart Xray with Rollback Protection
 log_info "Restarting Xray service..."
 systemctl enable xray >/dev/null 2>&1 || true
-systemctl restart xray || true
+
+RESTART_OK=true
+if ! systemctl restart xray; then
+    RESTART_OK=false
+fi
 
 # Verify Xray is running
 sleep 2
-if systemctl is-active --quiet xray; then
-    log_info "Xray service successfully started and active!"
-else
-    log_error "Xray service failed to start after applying new configuration!"
+if [ "$RESTART_OK" != "true" ] || ! systemctl is-active --quiet xray; then
+    log_error "Xray service failed to start/restart after applying new configuration!"
     journalctl -u xray -n 25 --no-pager || true
     if [ -n "$BACKUP_PATH" ] && [ -f "$BACKUP_PATH" ]; then
         log_warn "Initiating automatic rollback to previous configuration: ${BACKUP_PATH}..."
@@ -384,6 +388,7 @@ else
     fi
     exit 1
 fi
+log_info "Xray service successfully started and active!"
 
 # Firewall rules: support both iptables and ufw safely
 if command -v ufw &> /dev/null && ufw status | grep -q "Status: active"; then

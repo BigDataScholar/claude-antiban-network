@@ -216,20 +216,19 @@ def main():
 
     yaml_content = TEMPLATE_YAML.format(**node_dict)
 
-    # Restrict file permissions to 0600 on creation (owner read/write only) as it contains private proxy credentials
-    flags = os.O_WRONLY | os.O_CREAT | os.O_TRUNC
+    # Restrict file permissions to 0600 on creation/write (owner read/write only) as it contains private proxy credentials
     try:
+        if os.path.exists(output_path):
+            os.chmod(output_path, 0o600)
+        flags = os.O_WRONLY | os.O_CREAT | os.O_TRUNC
         fd = os.open(output_path, flags, 0o600)
         with open(fd, "w", encoding="utf-8") as f:
             f.write(yaml_content)
-        try:
-            os.chmod(output_path, 0o600)
-        except OSError as e:
-            print(f"[WARN] Unable to enforce 0600 permissions on {output_path}: {e}", file=sys.stderr)
+        os.chmod(output_path, 0o600)
         print(f"\n[SUCCESS] Generated Clash YAML Profile: {os.path.abspath(output_path)}")
         print(f"[SECURITY] Set file permissions to 0600: {os.path.abspath(output_path)}")
     except Exception as e:
-        print(f"\n[ERROR] Failed to write profile to {output_path}: {e}", file=sys.stderr)
+        print(f"\n[ERROR] Failed to write profile to {output_path} with 0600 permissions: {e}", file=sys.stderr)
         sys.exit(1)
 
     vless_node_info = {
