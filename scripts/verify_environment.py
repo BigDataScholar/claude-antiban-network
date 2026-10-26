@@ -2,16 +2,16 @@
 """
 Automated Anti-Ban Environment Gate Check
 Tests:
-1. Proxy reachability
-2. Egress IP, GeoIP (US), and ISP fraud score / datacenter flag
-3. Anthropic & Claude Infrastructure Reachability
-4. Gemini (Google) Accessibility & Region Check
-5. DNS Leak & WebRTC Risk Assessment
+1. Proxy reachability and Egress IP / GeoIP
+2. Real DNS resolver leak test (probes upstream DNS resolver country)
+3. Anthropic & Claude Gateway accessibility & challenge detection
+4. Gemini (Google) accessibility & regional policy test
+5. Local IPv6 bypass detection and WebRTC manual audit prompts
 """
 
 import argparse
 import json
-import re
+import socket
 import sys
 import urllib.request
 import urllib.error
@@ -42,41 +42,67 @@ def test_ip_and_geo(proxy_handler):
             
             is_us = country_code == "US"
             status_color = GREEN if is_us else RED
-            status_text = "PASS (US Native)" if is_us else f"FAIL ({country_code})"
+            status_text = "PASS (US)" if is_us else f"FAIL ({country_code})"
             
-            print(f"[{status_color}{status_text}{RESET}] IP Address : {ip}")
-            print(f"       Location   : {country} ({country_code}), {data.get('city', '')}")
-            print(f"       ISP / ASN  : {isp} / {as_name}")
+            print(f"[{status_color}{status_text}{RESET}] 出口 IP: {ip}")
+            print(f"       物理位置 : {country} ({country_code}), {data.get('city', '')}")
+            print(f"       ISP / 归属: {isp} / {as_name}")
             return is_us, ip
     except Exception as e:
-        print(f"[{RED}FAIL{RESET}] Failed to fetch IP Geo info: {e}")
+        print(f"[{RED}FAIL{RESET}] 无法获取出口 IP 归属信息: {e}")
         return False, None
+
+def test_dns_leak(proxy_handler):
+    opener = urllib.request.build_opener(proxy_handler)
+    # Query edns.ip-api.com which reflects the DNS resolver IP seen by authoritative servers
+    try:
+        req = urllib.request.Request("https://edns.ip-api.com/json", headers={"User-Agent": "curl/7.88.1"})
+        with opener.open(req, timeout=10) as resp:
+            data = json.loads(resp.read().decode())
+            dns_info = data.get("dns", {})
+            dns_ip = dns_info.get("ip", "")
+            dns_geo = dns_info.get("geo", "")
+
+            if "China" in dns_geo or dns_geo.startswith("CN"):
+                print(f"[{RED}LEAK DETECTED{RESET}] DNS 解析发生泄露!")
+                print(f"       解析服务器 : {dns_ip} ({dns_geo})")
+                print(f"       {YELLOW}风险提示: 您的常规未分流域名正被国内运营商 DNS 解析。请确保已在 Clash 启用 Fake-IP 模式并检查 nameserver 规则。{RESET}")
+                return False
+            else:
+                print(f"[{GREEN}PASS{RESET}] DNS 解析出口位于海外: {dns_ip} ({dns_geo})")
+                return True
+    except Exception as e:
+        print(f"[{YELLOW}UNVERIFIED{RESET}] 自动 DNS 泄露探针未能完成 ({e})，标记为未验证。建议人工在 https://ip.net.coffee/claude 中复核。")
+        return None
 
 def test_anthropic_and_claude(proxy_handler):
     opener = urllib.request.build_opener(proxy_handler)
     
     # 1. Test Anthropic API Edge
-    api_ok = False
+    api_reachable = False
     req_api = urllib.request.Request(
         "https://api.anthropic.com",
         headers={"User-Agent": "curl/7.88.1"}
     )
     try:
         with opener.open(req_api, timeout=10) as resp:
-            pass
+            api_reachable = True
+            print(f"[{GREEN}PASS{RESET}] Anthropic API 网关: 连接成功 (HTTP {resp.getcode()})")
     except urllib.error.HTTPError as e:
-        # Anthropic root returns 404 from origin, which proves origin is reached without block!
         cf_ray = e.headers.get("cf-ray", "")
-        if "LAX" in cf_ray or "SFO" in cf_ray or e.code == 404:
-            api_ok = True
-            print(f"[{GREEN}PASS{RESET}] Anthropic API Gateway: Connected to Cloudflare US Edge (cf-ray: {cf_ray or 'US'})")
+        if e.code == 404:
+            # 404 is the expected response from Anthropic API origin root
+            api_reachable = True
+            print(f"[{GREEN}PASS{RESET}] Anthropic API 网关: 直连成功 (Origin 404, cf-ray: {cf_ray or 'US'})")
+        elif e.code == 403:
+            print(f"[{RED}BLOCKED{RESET}] Anthropic API 网关返回 HTTP 403 (IP 可能被 Cloudflare 或 Anthropic 封禁)")
         else:
-            print(f"[{YELLOW}WARN{RESET}] Anthropic API Gateway returned HTTP {e.code} (cf-ray: {cf_ray})")
+            print(f"[{YELLOW}WARN{RESET}] Anthropic API 网关返回 HTTP {e.code} (cf-ray: {cf_ray})")
     except Exception as e:
-        print(f"[{RED}FAIL{RESET}] Anthropic API Connection Error: {e}")
+        print(f"[{RED}FAIL{RESET}] Anthropic API 网关连接异常: {e}")
 
-    # 2. Test Claude Web Edge
-    web_ok = False
+    # 2. Test Claude Web Front
+    web_status = "UNKNOWN"
     req_web = urllib.request.Request(
         "https://claude.ai",
         headers={
@@ -86,21 +112,26 @@ def test_anthropic_and_claude(proxy_handler):
     )
     try:
         with opener.open(req_web, timeout=10) as resp:
-            if resp.getcode() in [200, 301, 302, 307]:
-                web_ok = True
-                print(f"[{GREEN}PASS{RESET}] Claude Web Front: HTTP {resp.getcode()} (Direct Access)")
+            code = resp.getcode()
+            if code in [200, 301, 302, 307]:
+                web_status = "PASS"
+                print(f"[{GREEN}PASS{RESET}] Claude Web 网页端: 直达无阻 (HTTP {code})")
     except urllib.error.HTTPError as e:
         cf_mitigated = e.headers.get("cf-mitigated", "")
         cf_ray = e.headers.get("cf-ray", "")
-        if "challenge" in cf_mitigated or "LAX" in cf_ray or "SFO" in cf_ray:
-            web_ok = True
-            print(f"[{GREEN}PASS{RESET}] Claude Web Front: Reached Cloudflare US Edge ({cf_ray or 'US'}). Protected by browser-level verification.")
+        if "challenge" in cf_mitigated:
+            web_status = "CHALLENGE"
+            print(f"[{YELLOW}CHALLENGE{RESET}] Claude Web 网页端: 触发 Cloudflare 盾 (HTTP 403, cf-mitigated: challenge, cf-ray: {cf_ray})")
+            print(f"       说明: 这是针对脚本/非浏览器的正常人机验证。真实浏览器访问时由 Turnstile 验证通过。")
+        elif e.code == 403:
+            web_status = "BLOCKED"
+            print(f"[{RED}BLOCKED{RESET}] Claude Web 网页端: 被拦截 (HTTP 403, 可能是 IP 封锁或受限)")
         else:
-            print(f"[{RED}FAIL{RESET}] Claude Web Front returned HTTP {e.code}")
+            print(f"[{YELLOW}WARN{RESET}] Claude Web 网页端返回异常状态: HTTP {e.code}")
     except Exception as e:
-        print(f"[{RED}FAIL{RESET}] Claude Web Connection Error: {e}")
+        print(f"[{RED}FAIL{RESET}] Claude Web 网页端连接异常: {e}")
 
-    return api_ok or web_ok
+    return api_reachable, web_status
 
 def test_gemini(proxy_handler):
     opener = urllib.request.build_opener(proxy_handler)
@@ -114,20 +145,32 @@ def test_gemini(proxy_handler):
         with opener.open(req, timeout=12) as resp:
             content = resp.read().decode("utf-8", errors="ignore")
             if '["ZZ"]' in content or "not supported in your country" in content.lower():
-                print(f"[{RED}FAIL{RESET}] Gemini Blocked: Google GeoIP tagged as 'ZZ' or unsupported country!")
+                print(f"[{RED}BLOCKED{RESET}] Gemini 区域检测: 失败 (Google GeoIP 标记为国家代码 'ZZ'，未解锁)")
                 return False
             else:
-                print(f"[{GREEN}PASS{RESET}] Google Gemini Endpoint (HTTP {resp.getcode()}): Fully Accessible & Unblocked via WARP")
+                print(f"[{GREEN}PASS{RESET}] Google Gemini 区域检测: 成功 (未出现 ZZ 区域封锁)")
                 return True
     except Exception as e:
-        print(f"[{RED}FAIL{RESET}] Gemini Connection Error: {e}")
+        print(f"[{RED}FAIL{RESET}] Gemini 连接异常: {e}")
         return False
 
-def test_dns_hygiene(proxy_handler):
-    print(f"[{BLUE}AUDIT{RESET}] Verifying DNS and Routing Hygiene...")
-    print(f"  ✓ Fake-IP (198.18.0.0/16) intercepts AI domain queries before domestic resolution")
-    print(f"  ✓ Dual-ISP Xray server terminates TLS directly at the US node")
-    print(f"  ✓ UDP 443 (QUIC) blocked on VPS to eliminate UDP leak vectors")
+def check_local_ipv6_leak():
+    # Test if local machine has a functional public IPv6 route that might bypass IPv4 proxies
+    try:
+        s = socket.socket(socket.AF_INET6, socket.SOCK_DGRAM)
+        s.settimeout(2)
+        # Google Public DNS IPv6
+        s.connect(("2001:4860:4860::8888", 80))
+        local_ipv6 = s.getsockname()[0]
+        s.close()
+        if not local_ipv6.startswith("fe80:") and not local_ipv6.startswith("::1"):
+            print(f"[{YELLOW}WARN{RESET}] 本机检测到活跃的公网 IPv6 地址: {local_ipv6}")
+            print(f"       建议: 如果客户端代理未开启 IPv6 代理或未禁用 IPv6，可能会导致流量绕过代理发生泄露。")
+            return False
+    except Exception:
+        # IPv6 socket connect failed, meaning IPv6 is not actively leaking or not routed
+        pass
+    print(f"[{GREEN}PASS{RESET}] 本机 IPv6 泄露检查: 未发现直连绕行")
     return True
 
 def main():
@@ -136,7 +179,7 @@ def main():
     args = parser.parse_args()
 
     print_header("Claude & AI Anti-Ban Network Environment Gate Check")
-    print(f"Testing via Proxy: {args.proxy}")
+    print(f"正在通过代理检测: {args.proxy}")
 
     proxy_handler = urllib.request.ProxyHandler({
         "http": args.proxy,
@@ -146,34 +189,34 @@ def main():
     # 1. IP & Geo
     is_us, ip = test_ip_and_geo(proxy_handler)
 
-    # 2. Claude & Anthropic
-    claude_ok = test_anthropic_and_claude(proxy_handler)
+    # 2. DNS Leak
+    dns_clean = test_dns_leak(proxy_handler)
 
-    # 3. Gemini
+    # 3. Claude & Anthropic
+    api_reachable, web_status = test_anthropic_and_claude(proxy_handler)
+
+    # 4. Gemini
     gemini_ok = test_gemini(proxy_handler)
 
-    # 4. DNS hygiene
-    dns_ok = test_dns_hygiene(proxy_handler)
+    # 5. Local IPv6
+    ipv6_safe = check_local_ipv6_leak()
 
-    print_header("Verification Summary")
-    all_ok = is_us and claude_ok and gemini_ok
+    print_header("验收检测结论总结")
+    print(f"  - 出口 IP 归属: {'✓ 通过 (US)' if is_us else '✗ 失败'}")
+    print(f"  - DNS 解析状态: {'✓ 正常 (无国内泄露)' if dns_clean is True else ('✗ 存在泄露' if dns_clean is False else '? 未能自动化复核')}")
+    print(f"  - Anthropic API 网关: {'✓ 可直达' if api_reachable else '✗ 无法连接'}")
+    print(f"  - Claude Web 状态: {web_status}")
+    print(f"  - Gemini 区域解锁: {'✓ 未见 ZZ 封锁' if gemini_ok else '✗ 存在区域限制'}")
+    print(f"  - 本机 IPv6 绕行检查: {'✓ 安全' if ipv6_safe else '⚠ 需注意 IPv6 泄露风险'}")
 
-    if all_ok:
-        print(f"{BOLD}{GREEN}✓ EXCELLENT: Your environment passes all anti-ban security checks!{RESET}")
-        print("  - Egress IP: US Native Clean Residential/Commercial IP")
-        print("  - Claude & Anthropic: Unblocked & routed to US Edge")
-        print("  - Gemini: Fully accessible via VPS WARP split-tunneling")
-        print("  - Anti-leak: Fake-IP + TCP Keepalive + QUIC Blocking enabled")
-    else:
-        print(f"{BOLD}{RED}✗ ATTENTION: One or more critical checks failed. Please check the logs above.{RESET}")
-
-    print("\n[Anti-Ban Browser Tips]:")
-    print("1. Disable WebRTC in Chrome/Edge (install 'WebRTC Control' extension set to block).")
-    print("2. Keep Clash Verge active before opening Claude/ChatGPT.")
-    print("3. Avoid switching nodes frequently during an active Claude session.")
+    print("\n[人工审计与日常防封指引 (Manual Audit Tips)]:")
+    print("1. WebRTC 防护: 代理无法彻底关闭浏览器内部 WebRTC。请在 Chrome/Edge 中安装 'WebRTC Control' 插件并开启禁用。")
+    print("2. 欺诈分复核: 建议在权威数据库 https://scamalytics.com 中输入你的出口 IP 进行人工复核（低于 25 分为安全）。")
+    print("3. 稳定使用原则: 会话期间请勿频繁变动网络或切换节点。")
     print("=====================================================\n")
 
-    sys.exit(0 if all_ok else 1)
+    overall_pass = is_us and api_reachable and gemini_ok and (dns_clean is not False)
+    sys.exit(0 if overall_pass else 1)
 
 if __name__ == "__main__":
     main()

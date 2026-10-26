@@ -194,6 +194,14 @@ def main():
         print("Error: Missing required connection parameters (server_ip, port, uuid, public_key, short_id, sni)!", file=sys.stderr)
         sys.exit(1)
 
+    output_path = os.path.expanduser(args.output)
+    output_dir = os.path.dirname(os.path.abspath(output_path))
+    if output_dir:
+        os.makedirs(output_dir, exist_ok=True)
+
+    # Safely format node name for YAML (escaping inner double quotes)
+    escaped_node_name = node_name.replace('"', '\\"')
+
     node_dict = {
         "server_ip": server_ip,
         "port": port,
@@ -203,17 +211,24 @@ def main():
         "public_key": public_key,
         "short_id": short_id,
         "fingerprint": fingerprint,
-        "node_name": node_name
+        "node_name": escaped_node_name
     }
 
     yaml_content = TEMPLATE_YAML.format(**node_dict)
 
-    with open(args.output, "w", encoding="utf-8") as f:
+    with open(output_path, "w", encoding="utf-8") as f:
         f.write(yaml_content)
 
-    vless_url = generate_vless_url(node_dict)
+    # Restrict file permissions to 0600 (owner read/write only) as it contains private proxy credentials
+    try:
+        os.chmod(output_path, 0o600)
+    except Exception:
+        pass
 
-    print(f"\n[SUCCESS] Generated Clash YAML Profile: {os.path.abspath(args.output)}")
+    vless_url = generate_vless_url({**node_dict, "node_name": node_name})
+
+    print(f"\n[SUCCESS] Generated Clash YAML Profile: {os.path.abspath(output_path)}")
+    print(f"[SECURITY] Set file permissions to 0600: {os.path.abspath(output_path)}")
     print(f"\n[VLESS Share Link (for iOS Shadowrocket / Sing-box / Loon)]:\n{vless_url}\n")
 
 if __name__ == "__main__":

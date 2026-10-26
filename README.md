@@ -14,7 +14,7 @@
 3. **深度思考长连接中途掉线（Broken Pipe）**：在跑 o1/o3、Codex 或 Claude 深度长文本生成时，模型思考等待时间往往长达 30s ~ 120s+，普通代理因中途没有保活心跳被防火墙掐断，报 `stream disconnected: Broken pipe (os error 32)`；
 4. **DNS 与 WebRTC 泄露真实物理位置**：本地电脑若走传统代理，系统 DNS 往往仍会向国内运营商发起解析，或通过 WebRTC 暴露内网真实 IP。
 
-本套件通过**「双轨隔离分流 + 内核保活调优 + 终端全维防漏」**，彻底攻克上述所有痛点。
+本套件通过**「双轨隔离分流 + 内核保活调优 + 终端防漏加固」**，大幅降低网络层风控风险，解决长连接掉线与地区误判问题。
 
 ---
 
@@ -156,27 +156,30 @@ python3 scripts/generate_clash_config.py \
 python3 scripts/verify_environment.py --proxy http://127.0.0.1:7897
 ```
 
-如果看到如下输出，即代表环境达到最高安全级别：
+如果环境检测合格，输出示例如下：
 ```text
 =====================================================
  Claude & AI Anti-Ban Network Environment Gate Check 
 =====================================================
-Testing via Proxy: http://127.0.0.1:7897
-[PASS (US Native)] IP Address : 216.167.23.xxx
-       Location   : United States (US), Los Angeles
-       ISP / ASN  : NTT America, Inc. / AS2914
-[PASS] Anthropic API Gateway: Connected to Cloudflare US Edge (cf-ray: ...-LAX)
-[PASS] Claude Web Front: Reached Cloudflare US Edge (...-LAX). Protected by browser-level verification.
-[PASS] Google Gemini Endpoint (HTTP 200): Fully Accessible & Unblocked via WARP
-[AUDIT] Verifying DNS and Routing Hygiene...
-  ✓ Fake-IP (198.18.0.0/16) intercepts AI domain queries before domestic resolution
-  ✓ Dual-ISP Xray server terminates TLS directly at the US node
-  ✓ UDP 443 (QUIC) blocked on VPS to eliminate UDP leak vectors
+正在通过代理检测: http://127.0.0.1:7897
+[PASS (US)] 出口 IP: 216.167.23.xxx
+       物理位置 : United States (US), Los Angeles
+       ISP / 归属: NTT America, Inc. / AS2914
+[PASS] DNS 解析出口位于海外: 1.1.1.1 (Cloudflare)
+[PASS] Anthropic API 网关: 直连成功 (Origin 404, cf-ray: ...-LAX)
+[PASS] Claude Web 网页端: 直达无阻 (HTTP 200)
+[PASS] Google Gemini 区域检测: 成功 (未出现 ZZ 区域封锁)
+[PASS] 本机 IPv6 泄露检查: 未发现直连绕行
 
 =====================================================
- Verification Summary 
+ 验收检测结论总结 
 =====================================================
-✓ EXCELLENT: Your environment passes all anti-ban security checks!
+  - 出口 IP 归属: ✓ 通过 (US)
+  - DNS 解析状态: ✓ 正常 (无国内泄露)
+  - Anthropic API 网关: ✓ 可直达
+  - Claude Web 状态: PASS
+  - Gemini 区域解锁: ✓ 未见 ZZ 封锁
+  - 本机 IPv6 绕行检查: ✓ 安全
 ```
 
 ---
