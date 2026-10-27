@@ -30,7 +30,7 @@ flowchart TD
 
 1. **Claude / OpenAI 独享原生通道**：强制直连 VPS 绑定的纯净原生 IP，不与任何公用代理混跑，建立极高的发卡地信誉；
 2. **Google / Gemini WARP 自动补全**：针对 Google GeoIP 误将新机房识别为国家代码 "ZZ" 的问题，底层无缝路由至 Cloudflare WARP 美区清洁出口，两全其美；
-3. **内核级长连接保活 (TCP Keepalive)**：内核 `tcp_keepalive_time` 缩短为 30s，Xray 闲置断开延长至 1800s，通过链路双向保活协同调优，有效防范 Codex、o1/o3 及 Claude 长时间思考无数据包导致的 `Broken pipe (os error 32)`；
+3. **内核级长连接保活 (TCP Keepalive)**：内核 `tcp_keepalive_time` 缩短为 30s，Xray 闲置断开延长至 1800s，通过链路双向保活协同调优，有效防范 ChatGPT 及 Claude 长时间思考无数据包导致的 `Broken pipe (os error 32)`；
 4. **阻断常规泄露向量**：VPS 禁用 IPv6、阻断 UDP 443（QUIC），本地配合 Fake-IP 模式防范国内运营商 DNS 污染与代理通道解析泄漏（注: 浏览器端 WebRTC 仍需配合插件禁用以防本地直连泄露）。
 
 ---
