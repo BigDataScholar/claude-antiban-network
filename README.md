@@ -11,7 +11,7 @@
 
 1. **公用 IP 污染导致的批量封号**：公用机场节点成百上千人共用同一个出口，早被 Anthropic / OpenAI 风控系统标记为恶意爬虫或高危机房，开局即封号；
 2. **Google & Gemini 区域报错（"ZZ" 阻断）**：许多新购买的美区原生住宅 VPS，其 IP 未被 Google GeoIP 数据库收录，被识别为国家代码 `ZZ`，导致 Gemini / Google AI Studio 提示*“当前地区不支持”*；
-3. **深度思考长连接中途掉线（Broken Pipe）**：在跑 o1/o3、Codex 或 Claude 深度长文本生成时，模型思考等待时间往往长达 30s ~ 120s+，普通代理因中途没有保活心跳被防火墙掐断，报 `stream disconnected: Broken pipe (os error 32)`；
+3. **深度思考长连接中途掉线（Broken Pipe）**：在跑 Codex 或 Claude 深度长文本生成时，模型思考等待时间往往长达 30s ~ 120s+，普通代理因中途没有保活心跳被防火墙掐断，报 `stream disconnected: Broken pipe (os error 32)`；
 4. **DNS 与 WebRTC 泄露真实物理位置**：本地电脑若走传统代理，系统 DNS 往往仍会向国内运营商发起解析，或通过 WebRTC 暴露内网真实 IP。
 
 本套件通过**「双轨隔离分流 + 内核保活调优 + 终端防漏加固」**，大幅降低网络层风控风险，解决长连接掉线与地区误判问题。
