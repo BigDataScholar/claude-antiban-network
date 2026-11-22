@@ -15,12 +15,12 @@ description: >-
 
 ```mermaid
 flowchart TD
-    Client["本地设备 (Mac / Windows / iOS / Android)\nClash Verge Rev (系统代理 + TUN 双开 / Fake-IP)\n禁用公网 IPv6 + Chrome WebRTC Control"] -->|VLESS Reality (XTLS-rprx-vision)\nChrome 指纹 + Keepalive 15s| VPS["海外独享原生/双ISP VPS\nUbuntu 22.04+ / Debian 11+\nBBR + TCP Keepalive 30s + 禁用 IPv6"]
+    Client["本地设备 (Mac / Windows / iOS / Android)<br/>Clash Verge Rev · 系统代理 + TUN 双开 / Fake-IP<br/>禁用公网 IPv6 + Chrome WebRTC Control"] -->|"VLESS Reality · XTLS-rprx-vision / Keepalive 15s"| VPS["海外独享原生/双ISP VPS<br/>Ubuntu 22.04+ / Debian 11+<br/>BBR + TCP Keepalive 30s + 禁用 IPv6"]
 
-    VPS -->|Xray 精细路由| Router{"双轨隔离引擎"}
-    Router -->|"Claude / ChatGPT / Persona / Turnstile"| Direct["原生独享美区 IP\n(Fraud Score 0 / 极致防封)"]
-    Router -->|"Google / Gemini / AI Studio"| WARP["Cloudflare WARP (127.0.0.1:40000)\n(突破 ZZ 区域封锁)"]
-    Router -->|"UDP 443 (QUIC)"| Block["Blackhole 阻断\n(防 UDP 穿透泄露)"]
+    VPS -->|"Xray 精细路由"| Router{"双轨隔离引擎"}
+    Router -->|"Claude / ChatGPT / Persona / Turnstile"| Direct["原生独享美区 IP<br/>Fraud Score 0 / 极致防封"]
+    Router -->|"Google / Gemini / AI Studio"| WARP["Cloudflare WARP · 127.0.0.1:40000<br/>突破 ZZ 区域封锁"]
+    Router -->|"UDP 443 · QUIC"| Block["Blackhole 阻断<br/>防 UDP 穿透泄露"]
 ```
 
 ### 实战沉淀的 5 大关键防坑设计（Agent 务必遵循）
