@@ -2,6 +2,14 @@
 """
 Generate a hardened, anti-leak Clash Verge / Mihomo YAML profile and VLESS Share Link
 from VPS setup output.
+
+Battle-tested design:
+- Fake-IP + GEOSITE,geolocation-!cn + GEOIP,CN,DIRECT,no-resolve:
+  Zero domestic DNS leak for overseas domains AND zero GFW DoH hang.
+- Blocks UDP 443 (QUIC) to prevent browser UDP bypass/leak.
+- Dedicated AI group locked to the user's native residential US VPS.
+- Complete rules for Claude/Anthropic (incl. Persona/Turnstile), OpenAI/ChatGPT,
+  Google/Gemini/YouTube, Twitter/X (incl. twimg/t.co), and dev ecosystem.
 """
 
 import argparse
@@ -26,6 +34,9 @@ dns:
   enhanced-mode: fake-ip
   fake-ip-range: 198.18.0.1/16
   respect-rules: true
+  default-nameserver:
+    - 223.5.5.5
+    - 119.29.29.29
   nameserver:
     - 223.5.5.5
     - 119.29.29.29
@@ -33,20 +44,9 @@ dns:
     - 223.5.5.5
     - 119.29.29.29
   nameserver-policy:
-    "geosite:cn":
+    "geosite:cn,private":
       - 223.5.5.5
       - 119.29.29.29
-    "geosite:geolocation-!cn":
-      - "https://1.1.1.1/dns-query"
-      - "https://dns.google/dns-query"
-  fallback:
-    - "https://1.1.1.1/dns-query"
-    - "https://dns.google/dns-query"
-  fallback-filter:
-    geoip: true
-    geoip-code: CN
-    ipcidr:
-      - 240.0.0.0/4
 
 tun:
   enable: true
@@ -94,34 +94,55 @@ proxy-groups:
 
 rules:
   # ==========================================
-  # 1. 核心 AI 专属规则（直连原生独享美区纯净 IP）
+  # 1. 阻断 QUIC (UDP 443)，强制走 TCP 代理防止绕行与泄露
+  # ==========================================
+  - AND,((NETWORK,UDP),(DST-PORT,443)),REJECT
+
+  # ==========================================
+  # 2. 核心 AI 专属规则（直连原生独享美区纯净 IP）
   # ==========================================
   - DOMAIN-SUFFIX,anthropic.com,🚀 独享-AI与代码
   - DOMAIN-SUFFIX,claude.ai,🚀 独享-AI与代码
+  - DOMAIN-SUFFIX,claudeusercontent.com,🚀 独享-AI与代码
+  - DOMAIN-SUFFIX,withpersona.com,🚀 独享-AI与代码
+  - DOMAIN-SUFFIX,challenges.cloudflare.com,🚀 独享-AI与代码
   - DOMAIN-KEYWORD,anthropic,🚀 独享-AI与代码
   - DOMAIN-KEYWORD,claude,🚀 独享-AI与代码
   - DOMAIN-SUFFIX,openai.com,🚀 独享-AI与代码
   - DOMAIN-SUFFIX,chatgpt.com,🚀 独享-AI与代码
   - DOMAIN-SUFFIX,oaistatic.com,🚀 独享-AI与代码
   - DOMAIN-SUFFIX,oaiusercontent.com,🚀 独享-AI与代码
+  - DOMAIN-KEYWORD,openai,🚀 独享-AI与代码
+  - DOMAIN-KEYWORD,chatgpt,🚀 独享-AI与代码
   - DOMAIN-SUFFIX,sentry.io,🚀 独享-AI与代码
   - DOMAIN-SUFFIX,statsigapi.net,🚀 独享-AI与代码
   - DOMAIN-SUFFIX,intercom.io,🚀 独享-AI与代码
+  - DOMAIN-SUFFIX,stripe.com,🚀 独享-AI与代码
 
   # ==========================================
-  # 2. 谷歌与 Gemini 规则（VPS 内部自动无缝走 WARP 解锁）
+  # 3. 谷歌、Gemini 与 YouTube（VPS 内部自动走 WARP 解锁）
   # ==========================================
+  - GEOSITE,youtube,🌐 谷歌与Gemini
+  - GEOSITE,google,🌐 谷歌与Gemini
+  - DOMAIN-SUFFIX,youtube.com,🌐 谷歌与Gemini
+  - DOMAIN-SUFFIX,googlevideo.com,🌐 谷歌与Gemini
+  - DOMAIN-SUFFIX,ytimg.com,🌐 谷歌与Gemini
+  - DOMAIN-SUFFIX,ggpht.com,🌐 谷歌与Gemini
   - DOMAIN-SUFFIX,gemini.google.com,🌐 谷歌与Gemini
   - DOMAIN-SUFFIX,aistudio.google.com,🌐 谷歌与Gemini
   - DOMAIN-SUFFIX,generativelanguage.googleapis.com,🌐 谷歌与Gemini
   - DOMAIN-SUFFIX,proactivebackend-pa.googleapis.com,🌐 谷歌与Gemini
+  - DOMAIN-KEYWORD,gemini,🌐 谷歌与Gemini
   - DOMAIN-KEYWORD,antigravity,🌐 谷歌与Gemini
-  - GEOSITE,google,🌐 谷歌与Gemini
-  - GEOIP,google,🌐 谷歌与Gemini
 
   # ==========================================
-  # 3. 开发者常用生态（走独享节点防污染）
+  # 4. Twitter / X 与开发者常用生态
   # ==========================================
+  - GEOSITE,twitter,🚀 独享-AI与代码
+  - DOMAIN-SUFFIX,twitter.com,🚀 独享-AI与代码
+  - DOMAIN-SUFFIX,x.com,🚀 独享-AI与代码
+  - DOMAIN-SUFFIX,twimg.com,🚀 独享-AI与代码
+  - DOMAIN-SUFFIX,t.co,🚀 独享-AI与代码
   - DOMAIN-SUFFIX,github.com,🚀 独享-AI与代码
   - DOMAIN-SUFFIX,githubusercontent.com,🚀 独享-AI与代码
   - DOMAIN-SUFFIX,cursor.com,🚀 独享-AI与代码
@@ -129,20 +150,25 @@ rules:
   - DOMAIN-SUFFIX,v2ex.com,🚀 独享-AI与代码
 
   # ==========================================
-  # 4. 国内直连与内网拦截（杜绝流量外泄）
+  # 5. 全局非国内域名防漏拦截（Fake-IP 直送 VPS 远程解析）
+  # ==========================================
+  - GEOSITE,geolocation-!cn,🚀 独享-AI与代码
+
+  # ==========================================
+  # 6. 国内直连与内网拦截（no-resolve 彻底杜绝未知域名触发国内 DNS）
   # ==========================================
   - GEOIP,lan,DIRECT,no-resolve
   - GEOSITE,cn,DIRECT
-  - GEOIP,cn,DIRECT
+  - GEOIP,CN,DIRECT,no-resolve
 
   # ==========================================
-  # 5. 最终兜底
+  # 7. 最终兜底（未匹配域名一律远程解析并走独享节点）
   # ==========================================
   - MATCH,🐟 漏网之鱼
 """
 
+
 def generate_vless_url(node):
-    # vless://uuid@server:port?security=reality&encryption=none&pbk=...&headerType=none&fp=chrome&type=tcp&flow=xtls-rprx-vision&sni=...&sid=...#NodeName
     params = {
         "security": "reality",
         "encryption": "none",
@@ -157,6 +183,7 @@ def generate_vless_url(node):
     query_str = urllib.parse.urlencode(params)
     name_encoded = urllib.parse.quote(node.get("node_name", "🇺🇸 独享-Claude-原生住宅9929"))
     return f"vless://{node['uuid']}@{node['server_ip']}:{node['port']}?{query_str}#{name_encoded}"
+
 
 def main():
     parser = argparse.ArgumentParser(description="Generate Clash Verge / Mihomo profile and VLESS URL")
@@ -175,7 +202,7 @@ def main():
     data = {}
     if args.json_input:
         if os.path.exists(args.json_input):
-            with open(args.json_input, "r") as f:
+            with open(args.json_input, "r", encoding="utf-8") as f:
                 data = json.load(f)
         else:
             data = json.loads(args.json_input)
@@ -216,7 +243,7 @@ def main():
 
     yaml_content = TEMPLATE_YAML.format(**node_dict)
 
-    # Restrict file permissions to 0600 on creation/write (owner read/write only) as it contains private proxy credentials
+    # Restrict file permissions to 0600 on creation/write (owner read/write only)
     try:
         if os.path.exists(output_path):
             os.chmod(output_path, 0o600)
@@ -245,6 +272,7 @@ def main():
     vless_url = generate_vless_url(vless_node_info)
 
     print(f"\n[VLESS Share Link (for iOS Shadowrocket / Sing-box / Loon)]:\n{vless_url}\n")
+
 
 if __name__ == "__main__":
     main()

@@ -1,148 +1,147 @@
 ---
 name: claude-antiban-network
 description: >-
-  用于引导用户或自动化将新购买的海外原生住宅/双ISP VPS（如 LisaHost、搬瓦工等）搭建为防 Claude/ChatGPT 封号的高防专属网络环境。
-  覆盖 VPS 服务端 Xray VLESS Reality 搭建、Cloudflare WARP 双轨分流（解锁 Gemini/Google 同时保持 Claude 纯净直连）、Linux 内核 TCP Keepalive 调优（有效缓解长文本推理断流 Broken Pipe）、一键生成本地 Clash Verge/Mihomo 配置文件及 iOS 导入链接、以及端到端连通性与代理路径防泄漏门禁自检。
+  纯 AI Agent 全自动化防封网络搭建技能套件。用于将全新海外原生住宅/双ISP VPS（如 LisaHost、搬瓦工等）
+  全自动部署为防 Claude / ChatGPT 封号的高纯净独享网络环境，涵盖 VPS 端 Xray VLESS Reality、
+  Cloudflare WARP 双轨分流（解锁 Gemini 同时锁定 Claude 原生直连）、Linux 内核 TCP Keepalive 防断流、
+  本地零泄露防卡顿 Clash Verge 配置生成、本机 IPv6 / WebRTC / Fake-IP 系统级加固与 6 项门禁自动化验收。
 ---
 
-# Claude 防封网络全自动化搭建与加固技能 (claude-antiban-network)
+# Claude 防封网络全自动化搭建技能 (claude-antiban-network)
 
-## 技能概述
+## 技能定位与核心架构
 
-本技能为 AI Agent 提供了端到端的**「Claude 专属防封网络自动化搭建与验证」**能力。
-针对国内用户使用海外 AI 服务时高频遇到的**账号封禁、Gemini 地区限制（"ZZ"代码）、长文本思考掉线（Broken Pipe）、DNS 泄露**等痛点，提供工业级的标准落地流程。
-
-### 核心架构：双轨隔离防封体系 (Dual-Track Isolation)
+本技能面向 AI Agent（Google Antigravity / Cursor / Claude Code / Codex 等），提供**端到端、零手工折腾**的 Claude / ChatGPT / Gemini 防封专属网络自动化落地流程。
 
 ```mermaid
 flowchart TD
-    Client["本地设备 (Mac / PC / iOS)"] -->|Clash Verge / Mihomo (Fake-IP)| Proxy["LisaHost 独享双ISP VPS (VLESS Reality)"]
-    
-    Proxy -->|域名识别分流| Router{"Xray 内部路由引擎"}
-    
-    Router -->|"Claude / OpenAI (直连原生住宅IP)"| Direct["Native US Residential IP\n(极致防封 / 无污染)"]
-    Router -->|"Google / Gemini (分流走 WARP)"| WARP["Cloudflare WARP 40000\n(突破 ZZ 区域封锁)"]
-    Router -->|"UDP 443 (QUIC)"| Block["Blackhole 阻断\n(杜绝 UDP IP/DNS 泄露)"]
-    
-    Direct --> Claude["Claude.ai / OpenAI"]
-    WARP --> Gemini["Gemini / Google AI Studio"]
+    Client["本地设备 (Mac / Windows / iOS / Android)\nClash Verge Rev (系统代理 + TUN 双开 / Fake-IP)\n禁用公网 IPv6 + Chrome WebRTC Control"] -->|VLESS Reality (XTLS-rprx-vision)\nChrome 指纹 + Keepalive 15s| VPS["海外独享原生/双ISP VPS\nUbuntu 22.04+ / Debian 11+\nBBR + TCP Keepalive 30s + 禁用 IPv6"]
+
+    VPS -->|Xray 精细路由| Router{"双轨隔离引擎"}
+    Router -->|"Claude / ChatGPT / Persona / Turnstile"| Direct["原生独享美区 IP\n(Fraud Score 0 / 极致防封)"]
+    Router -->|"Google / Gemini / AI Studio"| WARP["Cloudflare WARP (127.0.0.1:40000)\n(突破 ZZ 区域封锁)"]
+    Router -->|"UDP 443 (QUIC)"| Block["Blackhole 阻断\n(防 UDP 穿透泄露)"]
 ```
 
-1. **Claude / OpenAI 独享原生通道**：强制直连 VPS 绑定的纯净原生 IP，不与任何公用代理混跑，建立极高的发卡地信誉；
-2. **Google / Gemini WARP 自动补全**：针对 Google GeoIP 误将新机房识别为国家代码 "ZZ" 的问题，底层无缝路由至 Cloudflare WARP 美区清洁出口，两全其美；
-3. **内核级长连接保活 (TCP Keepalive)**：内核 `tcp_keepalive_time` 缩短为 30s，Xray 闲置断开延长至 1800s，通过链路双向保活协同调优，有效防范 ChatGPT 及 Claude 长时间思考无数据包导致的 `Broken pipe (os error 32)`；
-4. **阻断常规泄露向量**：VPS 禁用 IPv6、阻断 UDP 443（QUIC），本地配合 Fake-IP 模式防范国内运营商 DNS 污染与代理通道解析泄漏（注: 浏览器端 WebRTC 仍需配合插件禁用以防本地直连泄露）。
+### 实战沉淀的 5 大关键防坑设计（Agent 务必遵循）
+
+1. **零泄露且绝不卡顿的本地 DNS 策略**：
+   * 本套件生成的 Clash 配置采用 **`Fake-IP` + `GEOSITE,geolocation-!cn` + `GEOIP,CN,DIRECT,no-resolve`** 组合。
+   * **原理**：所有海外与未命中直连的域名直接通过 Fake-IP 以域名形式送往美西 VPS 远程解析（实测上游为美国 Cloudflare DNS，零国内泄露）；同时避免在本地直连海外 DoH（如 `dns.cloudflare.com`）被防火墙限速卡死导致 X / YouTube 无法打开。
+   * **避坑**：导入 Clash Verge Rev 后，**不要**开启 Clash Verge 全局 DNS 覆写去覆盖本配置（若用户开启了全局覆写，需对该配置关闭 DNS 覆写）。
+2. **「系统代理 + TUN 模式」双开防投毒**：
+   * 仅开 TUN 时，用户在中途切换 Wi-Fi（公司 ⇄ 热点 ⇄ 家里）容易被新路由器覆盖系统 DNS 导致 GFW DNS 投毒。
+   * 必须引导用户**同时开启「系统代理 (System Proxy)」与「TUN 模式 (Tun Mode)」**（互不重叠、不卡电脑，浏览器直走代理端口免疫换网投毒，终端/CLI 由 TUN 全局兜底）。
+3. **本机公网 IPv6 隔离**：
+   * 国内家庭宽带常分配联通 `2408:` / 电信 `240e:` / 移动 `2409:` 公网 IPv6。必须通过门禁脚本检查，若检出活跃公网 IPv6，必须引导用户将其改为「仅本地链接」（macOS）或取消勾选 IPv6（Windows）。
+4. **严格业务隔离（保护 0 分独享 IP）**：
+   * 一人一机独享，严禁多人多账号拼车共用同一 VPS（连带封号高危）；
+   * 若用户有高频自动化爬虫/采集需求（如每天数千次抓取 Facebook 等），提醒将其拆分至独立策略组走中转节点，切勿污染 Claude 独享 IP。
+5. **安全红线**：
+   * 严禁将用户的真实 VPS IP、SSH 密码、UUID、私钥写入仓库或任何可公开文件；
+   * `scripts/vps_setup.sh` 已内置无损保留既有配置（多客户端、多 shortId、附加 inbound）、预检校验与失败自动回滚保护。
 
 ---
 
-## 目录结构说明
+## 目录结构
 
-本技能目录位于 `<skill-path>`（安装于 `~/.gemini/config/skills/claude-antiban-network/`）：
-* `scripts/vps_setup.sh`：VPS 服务端一键安装脚本（自动安装 Xray、WARP、配置内核参数与防火墙，输出 JSON 元数据）。
-* `scripts/generate_clash_config.py`：本地客户端配置生成器（将 VPS 参数转化为开箱即用的 Clash Verge/Mihomo YAML 配置及移动端 VLESS 链接）。
-* `scripts/verify_environment.py`：端到端连通性与防泄露自动化检测门禁（检测美区 IP、Claude/Gemini 状态、DNS 解析环境）。
+* `scripts/vps_setup.sh`：VPS 端全自动部署脚本（Xray Reality + WARP 双轨分流 + 内核 BBR/Keepalive + 禁用 IPv6 + 防火墙 + 原子替换回滚 + JSON 输出）。
+* `scripts/generate_clash_config.py`：本地配置生成器（输出 `0600` 权限 Clash Verge 防漏配置 + 移动端 `vless://` 链接，纯 Python 3 标准库零依赖）。
+* `scripts/verify_environment.py`：端到端 6 项门禁验收脚本（US 出口、上游 DNS 防漏、Anthropic API/Web、Gemini ZZ 检测、本机公网 IPv6 检测、本机 Fake-IP 接管诊断）。
+* `templates/`：与脚本保持同步的服务端/客户端参考模板。
 
 ---
 
-## Agent 标准执行工作流
+## Agent 6 步全自动执行 SOP
 
-当用户提出“帮我把新买的 VPS 配置成 Claude 节点”、“怎么搭建防止 Claude 封号的网络”、“检查我的代理有没有 DNS 泄露”等需求时，Agent 应遵循以下五步走流程：
+当用户请求搭建或检查防 Claude 封号网络时，Agent 应严格按以下 6 步闭环推进：
 
-### 第一步：交互式信息采集
+### 第 1 步：交互式采集 VPS 凭证与环境确认
 
-向用户询问并确认目标 VPS 的连接凭证：
-1. **VPS IP 地址**
-2. **SSH 端口号**（LisaHost 等主机商通常为自定义高位端口，如 `22903`）
-3. **SSH 账号**（通常为 `root`）
+向用户收集：
+1. **VPS 公网 IPv4 地址**
+2. **SSH 端口号**（如 LisaHost 等主机商通常为自定义高位端口）
+3. **SSH 登录账号**（通常为 `root`）
 4. **SSH 密码或本地私钥路径**
 
+> **新手科普提示**：VPS 系统需为 **Ubuntu 22.04+ 或 Debian 11+**。若用户疑惑为何是“乌班图（Ubuntu）”，说明 Ubuntu 是行业最标准的轻量服务器系统，不要重装成 Windows。
+
 ---
 
-### 第二步：自动化远程 VPS 部署
+### 第 2 步：远程全自动部署 VPS 服务端
 
-通过 SSH 远程执行服务端初始化脚本。
+将 `<skill-path>/scripts/vps_setup.sh` 传送至目标 VPS 并以 `root` 权限执行：
 
 ```bash
-# 1. 将 vps_setup.sh 传送到远程 VPS
-scp -P <SSH_PORT> ~/.gemini/config/skills/claude-antiban-network/scripts/vps_setup.sh root@<VPS_IP>:/tmp/vps_setup.sh
-
-# 2. 远程以 root 权限执行并捕获输出
+scp -P <SSH_PORT> <skill-path>/scripts/vps_setup.sh root@<VPS_IP>:/tmp/vps_setup.sh
 ssh -p <SSH_PORT> root@<VPS_IP> "bash /tmp/vps_setup.sh"
 ```
 
-> **注意**：脚本执行结束时会打印类似如下的 JSON 块：
-> ```json
-> ###JSON_OUTPUT_START###
-> {
->   "server_ip": "216.167.23.xxx",
->   "port": 24433,
->   "uuid": "xxxxxxxx-xxxx-xxxx-xxxx-xxxxxxxxxxxx",
->   "flow": "xtls-rprx-vision",
->   "security": "reality",
->   "sni": "gateway.icloud.com",
->   "public_key": "xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx",
->   "short_id": "xxxxxxxxxxxxxxxx",
->   "fingerprint": "chrome",
->   "warp_port": 40000
-> }
-> ###JSON_OUTPUT_END###
-> ```
-> Agent 需解析提取该 JSON 块用于下一步。
+* 若本地无 `sshpass` 且需密码登录，macOS 可用系统自带 `/usr/bin/expect` 安全执行（勿将密码落盘持久化）。
+* 脚本末尾会打印标准 JSON 元数据块：
+  ```text
+  ###JSON_OUTPUT_START###
+  { ... }
+  ###JSON_OUTPUT_END###
+  ```
+* 提取完整 JSON 块用于第 3 步；同时确认 `warp_ready` 是否为 `true`（若为 `false`，说明已自动降级为 `direct` 保活，可按需协助排查 WARP）。
 
 ---
 
-### 第三步：生成本地客户端配置文件与移动端链接
+### 第 3 步：生成本地防漏配置与移动端订阅链接
 
-在本地环境调用生成脚本，生成 Clash Verge / Mihomo 配置文件及手机端链接：
+使用第 2 步提取的 JSON 调用生成脚本：
 
 ```bash
-python3 ~/.gemini/config/skills/claude-antiban-network/scripts/generate_clash_config.py \
-  --json-input '<提取到的JSON字符串>' \
+python3 <skill-path>/scripts/generate_clash_config.py \
+  --json-input '<提取到的完整JSON>' \
   --name "🇺🇸 独享-Claude-原生住宅9929" \
   --output "~/Desktop/Claude-独享纯美区配置.yaml"
 ```
 
-执行后将输出：
-1. 本地 YAML 完整路径（保存在用户桌面上，方便拖拽）。
-2. `vless://...` 格式的直连分享链接（可直接导入 iPhone 小火箭 / Shadowrocket / Sing-box / Loon）。
+向用户交付：
+1. 桌面生成的 `Claude-独享纯美区配置.yaml`（已自动设置 `0600` 权限）；
+2. 终端输出的 `vless://...` 链接（用于手机端 Shadowrocket / Sing-box / Loon）。
 
 ---
 
-### 第四步：引导用户客户端导入
+### 第 4 步：引导客户端导入与「双开」加固
 
-向用户清晰展示如下 3 步操作引导：
-1. **电脑端（Mac / Windows）**：
-   * 打开 **Clash Verge Rev**；
-   * 点击左侧 **订阅 (Profiles)**，将桌面上的 `Claude-独享纯美区配置.yaml` 直接拖入窗口；
-   * 右键该配置，选择 **使用 (Use)**；
-   * 确保软件左下角的 **系统代理 (System Proxy)** 和 **TUN 模式 (Tun Mode)** 已开启；
-   * 在代理组中，将 `🚀 独享-AI与代码` 和 `🌐 谷歌与Gemini` 选中为你的独享节点。
+清晰引导用户完成客户端配置（每一步都很关键）：
+1. **电脑端（Clash Verge Rev）**：
+   * 左侧 **订阅 (Profiles)** ➔ 将桌面 `Claude-独享纯美区配置.yaml` 拖入窗口 ➔ 右键点击 **使用 (Use)**；
+   * 左侧 **设置 / 主页** ➔ **同时开启「系统代理 (System Proxy)」与「TUN 模式 (Tun Mode)」**；
+   * 左侧 **代理 (Proxies)** ➔ 确认 `🚀 独享-AI与代码`、`🌐 谷歌与Gemini`、`🐟 漏网之鱼` 均已选中你的独享节点；
+   * 若用户之前开启了 Clash Verge 全局 DNS 覆写，提醒对该配置**关闭 DNS 覆写**（避免覆写引入直连海外 DoH 导致卡顿）。
 2. **手机端（iOS / Android）**：
-   * 复制生成的 `vless://...` 链接；
-   * 打开 Shadowrocket / Sing-box，点击从剪贴板添加节点即可。
+   * 复制 `vless://...` 链接导入 Shadowrocket / Sing-box / Loon。
+3. **浏览器防 WebRTC 泄露**：
+   * 在 Chrome / Edge 商店安装免费插件 **`WebRTC Control`**，并点击右上角插件图标使其亮起**蓝色状态**（禁用 WebRTC）。
 
 ---
 
-### 第五步：自动化门禁检测与验收（覆盖代理路径）
+### 第 5 步：全自动 6 项门禁验收与本机系统排雷
 
-在本地通过代理端口执行自动化验证测试：
+待用户启动 Clash Verge 后，在本地运行门禁检测脚本：
 
 ```bash
-python3 ~/.gemini/config/skills/claude-antiban-network/scripts/verify_environment.py --proxy http://127.0.0.1:7897
+python3 <skill-path>/scripts/verify_environment.py --proxy http://127.0.0.1:7897
 ```
 
-* **检测项覆盖**：
-  * **Egress IP & 地理位置**：确认是原生美国（US）IP，无漂移；
-  * **Claude / Anthropic 连通性**：确认可无阻碍到达 Cloudflare 美区边缘节点；
-  * **Gemini 地区限制与网关可达**：确认无 `["ZZ"]` 阻断标识；
-  * **代理路径防泄漏审计**：确认代理上游 DNS 为海外解析器、无国内运营商泄露，且本机无公网 IPv6 直连绕行（注: 浏览器 WebRTC 仍需插件配合阻断）。
+**根据脚本输出结果执行闭环修复**：
+* **若检出本机公网 IPv6 泄露**（`[LEAK RISK]`）：
+  * **macOS**：引导用户打开 `系统设置 ➔ 网络 ➔ Wi-Fi ➔ 详细信息 ➔ TCP/IP ➔ 配置 IPv6` 改为 **「仅本地链接」** ➔ 点「好」；
+  * **Windows**：引导用户打开网络适配器属性，取消勾选 `Internet 协议版本 6 (TCP/IPv6)`；
+  * 改完后重新运行 `verify_environment.py`，确认输出 **`[GATE: PASS]`**！
+* **若提示 Fake-IP 未接管**（`[WARN]`）：引导用户在 Clash Verge 中关开一次「TUN 模式」开关并确认「系统代理」已开启。
+* **最终双站复核**：引导用户在 Chrome 打开 `https://ip.net.coffee/claude`（确认 Trust Score 满分、DNS 未泄露、WebRTC 已禁用）及 `https://scamalytics.com`（确认 Fraud Score < 25）。
 
 ---
 
-## 终极防封行为守则（交付给用户）
+### 第 6 步：交付防封行为守则与常见故障速查
 
-除了网络环境达标外，引导用户注意以下 4 个关键防封要点：
-1. **支付订阅安全（重中之重）**：严禁在网页端强刷国内普通双币卡（极易触发 Stripe 欺诈拒付并封号）。建议在安卓手机端通过 **Google Play 绑定国内 Visa / Mastercard** 订阅 Claude Pro，原价 $20/月且零风控；
-2. **会话期间保持 IP 静态稳定**：在 Claude 网页端打字或运行代码时，切忌频繁切换代理节点，防止触发多地会话劫持拦截；
-3. **排查浏览器 WebRTC 泄露**：Chrome/Edge 建议安装 `WebRTC Control` 插件，将其开关置于禁用（Block）状态，防范物理局域网地址泄漏；
-4. **内容安全合规**：中文或国内商务内容本身 100% 安全（不会因中文封号），但切勿要求模型生成黑客攻击、违规爬虫等违反 AUP 协议的内容。
+完成验收后，务必向用户简明交付以下 4 条实战经验：
+1. **支付避坑（重中之重）**：严禁在网页端强刷国内双币卡（Stripe 极易拒付封号）；推荐在安卓端通过 **Google Play 绑定国内 Visa / Mastercard** 原价订阅 Claude Pro（\$20/月，零加价且零 Stripe 风控）。
+2. **一人一机独享原则**：本人自己的手机/电脑/iPad 同连这台独享 VPS 登录同一个 Claude 账号非常安全；严禁多人多账号拼车共用同一 IP，严禁把高频爬虫混跑在 Claude 独享 IP 上。
+3. **换 Wi-Fi 偶发异常秒解**：若切换 Wi-Fi 后遇到外网打不开或 Claude 提示「在您所在的地区不可用」（**注意：这不是封号，只是短暂漏走国内 IP 的实时地域拦截**），在 Clash Verge 里**关开一次 TUN 开关**即可 3 秒恢复。
+4. **切勿找主机商“换解锁 Gemini IP”**：新 IP 若遇 Gemini 地区报错，本套件的 WARP 双轨分流已自动无损解锁，切勿向主机商申请换“解锁 IP”（大概率换到被别人滥用过的二手高危 IP）。

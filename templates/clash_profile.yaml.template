@@ -14,6 +14,9 @@ dns:
   enhanced-mode: fake-ip
   fake-ip-range: 198.18.0.1/16
   respect-rules: true
+  default-nameserver:
+    - 223.5.5.5
+    - 119.29.29.29
   nameserver:
     - 223.5.5.5
     - 119.29.29.29
@@ -21,20 +24,9 @@ dns:
     - 223.5.5.5
     - 119.29.29.29
   nameserver-policy:
-    "geosite:cn":
+    "geosite:cn,private":
       - 223.5.5.5
       - 119.29.29.29
-    "geosite:geolocation-!cn":
-      - "https://1.1.1.1/dns-query"
-      - "https://dns.google/dns-query"
-  fallback:
-    - "https://1.1.1.1/dns-query"
-    - "https://dns.google/dns-query"
-  fallback-filter:
-    geoip: true
-    geoip-code: CN
-    ipcidr:
-      - 240.0.0.0/4
 
 tun:
   enable: true
@@ -48,18 +40,18 @@ tun:
 proxies:
   - name: "{{NODE_NAME}}"
     type: vless
-    server: {{SERVER_IP}}
+    server: "{{SERVER_IP}}"
     port: {{PORT}}
-    uuid: {{UUID}}
+    uuid: "{{UUID}}"
     network: tcp
     udp: true
     tls: true
-    flow: {{FLOW}}
-    servername: {{SNI}}
+    flow: "{{FLOW}}"
+    servername: "{{SNI}}"
     reality-opts:
-      public-key: {{PUBLIC_KEY}}
-      short-id: {{SHORT_ID}}
-    client-fingerprint: {{FINGERPRINT}}
+      public-key: "{{PUBLIC_KEY}}"
+      short-id: "{{SHORT_ID}}"
+    client-fingerprint: "{{FINGERPRINT}}"
 
 proxy-groups:
   - name: "🚀 独享-AI与代码"
@@ -81,22 +73,48 @@ proxy-groups:
       - DIRECT
 
 rules:
+  - AND,((NETWORK,UDP),(DST-PORT,443)),REJECT
   - DOMAIN-SUFFIX,anthropic.com,🚀 独享-AI与代码
   - DOMAIN-SUFFIX,claude.ai,🚀 独享-AI与代码
+  - DOMAIN-SUFFIX,claudeusercontent.com,🚀 独享-AI与代码
+  - DOMAIN-SUFFIX,withpersona.com,🚀 独享-AI与代码
+  - DOMAIN-SUFFIX,challenges.cloudflare.com,🚀 独享-AI与代码
   - DOMAIN-KEYWORD,anthropic,🚀 独享-AI与代码
   - DOMAIN-KEYWORD,claude,🚀 独享-AI与代码
   - DOMAIN-SUFFIX,openai.com,🚀 独享-AI与代码
   - DOMAIN-SUFFIX,chatgpt.com,🚀 独享-AI与代码
   - DOMAIN-SUFFIX,oaistatic.com,🚀 独享-AI与代码
   - DOMAIN-SUFFIX,oaiusercontent.com,🚀 独享-AI与代码
+  - DOMAIN-KEYWORD,openai,🚀 独享-AI与代码
+  - DOMAIN-KEYWORD,chatgpt,🚀 独享-AI与代码
+  - DOMAIN-SUFFIX,sentry.io,🚀 独享-AI与代码
+  - DOMAIN-SUFFIX,statsigapi.net,🚀 独享-AI与代码
+  - DOMAIN-SUFFIX,intercom.io,🚀 独享-AI与代码
+  - DOMAIN-SUFFIX,stripe.com,🚀 独享-AI与代码
+  - GEOSITE,youtube,🌐 谷歌与Gemini
+  - GEOSITE,google,🌐 谷歌与Gemini
+  - DOMAIN-SUFFIX,youtube.com,🌐 谷歌与Gemini
+  - DOMAIN-SUFFIX,googlevideo.com,🌐 谷歌与Gemini
+  - DOMAIN-SUFFIX,ytimg.com,🌐 谷歌与Gemini
+  - DOMAIN-SUFFIX,ggpht.com,🌐 谷歌与Gemini
   - DOMAIN-SUFFIX,gemini.google.com,🌐 谷歌与Gemini
   - DOMAIN-SUFFIX,aistudio.google.com,🌐 谷歌与Gemini
   - DOMAIN-SUFFIX,generativelanguage.googleapis.com,🌐 谷歌与Gemini
-  - GEOSITE,google,🌐 谷歌与Gemini
-  - GEOIP,google,🌐 谷歌与Gemini
+  - DOMAIN-SUFFIX,proactivebackend-pa.googleapis.com,🌐 谷歌与Gemini
+  - DOMAIN-KEYWORD,gemini,🌐 谷歌与Gemini
+  - DOMAIN-KEYWORD,antigravity,🌐 谷歌与Gemini
+  - GEOSITE,twitter,🚀 独享-AI与代码
+  - DOMAIN-SUFFIX,twitter.com,🚀 独享-AI与代码
+  - DOMAIN-SUFFIX,x.com,🚀 独享-AI与代码
+  - DOMAIN-SUFFIX,twimg.com,🚀 独享-AI与代码
+  - DOMAIN-SUFFIX,t.co,🚀 独享-AI与代码
   - DOMAIN-SUFFIX,github.com,🚀 独享-AI与代码
+  - DOMAIN-SUFFIX,githubusercontent.com,🚀 独享-AI与代码
   - DOMAIN-SUFFIX,cursor.com,🚀 独享-AI与代码
+  - DOMAIN-SUFFIX,cursor.sh,🚀 独享-AI与代码
+  - DOMAIN-SUFFIX,v2ex.com,🚀 独享-AI与代码
+  - GEOSITE,geolocation-!cn,🚀 独享-AI与代码
   - GEOIP,lan,DIRECT,no-resolve
   - GEOSITE,cn,DIRECT
-  - GEOIP,cn,DIRECT
+  - GEOIP,CN,DIRECT,no-resolve
   - MATCH,🐟 漏网之鱼

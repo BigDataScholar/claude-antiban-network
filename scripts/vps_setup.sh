@@ -257,6 +257,9 @@ cat > "$TMP_CONFIG" << EOF
       "streamSettings": {
         "network": "tcp",
         "security": "reality",
+        "sockopt": {
+          "tcpKeepAliveInterval": 15
+        },
         "realitySettings": {
           "show": false,
           "dest": "${SNI}:443",
@@ -283,6 +286,11 @@ cat > "$TMP_CONFIG" << EOF
       "protocol": "freedom",
       "settings": {
         "domainStrategy": "UseIPv4"
+      },
+      "streamSettings": {
+        "sockopt": {
+          "tcpKeepAliveInterval": 15
+        }
       }
     },
     {
@@ -322,8 +330,13 @@ cat > "$TMP_CONFIG" << EOF
       {
         "type": "field",
         "domain": [
+          "geosite:anthropic",
+          "geosite:openai",
           "domain:claude.ai",
           "domain:anthropic.com",
+          "domain:claudeusercontent.com",
+          "domain:withpersona.com",
+          "domain:challenges.cloudflare.com",
           "domain:openai.com",
           "domain:chatgpt.com",
           "domain:oaistatic.com",
@@ -337,7 +350,13 @@ cat > "$TMP_CONFIG" << EOF
           "geosite:google",
           "domain:gemini.google.com",
           "domain:aistudio.google.com",
-          "domain:generativelanguage.googleapis.com"
+          "domain:generativelanguage.googleapis.com",
+          "domain:deepmind.google",
+          "domain:deepmind.com",
+          "domain:alkalicore-pa.clients6.google.com",
+          "domain:alkalimakersuite-pa.clients6.google.com",
+          "domain:webchannel-alkalimakersuite-pa.clients6.google.com",
+          "domain:robinfrontend-pa.googleapis.com"
         ],
         "outboundTag": "${GOOGLE_OUTBOUND}"
       },
