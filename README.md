@@ -7,14 +7,14 @@
 
 ## 🎯 核心特性与工程保障
 
-经过长期实战打磨与多轮安全审计（涵盖首次部署、失败回滚、凭证安全与客户端真实验收），本项目具备以下特性：
+经过长期实战打磨与多轮独立安全审计（涵盖全新首次部署、上游安装器兼容、非 root 服务账号、失败回滚与客户端真实验收），本项目具备以下特性：
 
-* **全新 VPS 优先与安全边界**：默认仅支持全新 Debian 11+ / Ubuntu 22.04+ VPS；若检测到已有 Xray 或 WARP，在修改任何系统文件前即刻中止退出，绝不误伤存量服务；
-* **零凭证进聊天 / 命令历史**：优先使用本机 SSH 密钥 / `ssh-agent`（不索要明文 root 密码），服务端配置/备份/节点元数据在创建时即锁定 `0600` 权限，节点凭证与手机订阅链接全程通过受限文件交接；
-* **固定供应链版本**：固定经验证的官方 `XTLS/Xray-install` 提交哈希与 SHA256 校验和，并固定 Xray-core 发行版（`v26.11.9`）；
+* **全新 VPS 优先与失败回滚**：默认仅支持全新 Debian 11+ / Ubuntu 22.04+ VPS；若检测到已有 Xray 或 WARP，在修改任何系统文件前即刻中止退出；防火墙校验提前到覆盖 `config.json` 与重启 Xray **之前**，任何失败均自动回滚临时配置与 `sysctl`，并支持 `ALLOW_EXISTING=true` 干净重试；
+* **零凭证进聊天 / 命令参数**：优先使用本机 SSH 密钥 / `ssh-agent`（同时支持 `root` 与非 root `sudo` VPS，绝不索要明文密码），服务端全程通过 stdin 处理私钥与 UUID（不进入子进程命令行参数），节点元数据与手机链接全程通过 `0600` 受限文件交接；
+* **固定供应链版本与最小权限运行**：固定经验证的官方 `XTLS/Xray-install` 提交哈希与 SHA256 校验和及 Xray-core 发行版（`v26.11.9`），保留上游非 root `User=xray` 服务账号（`/usr/local/etc/xray` `0750 root:xray`、`config.json` `0640 root:xray`，备份与元数据严格 `0600`）；
 * **双轨隔离与防断流**：Claude / ChatGPT 强制走独享美区原生 IP；Google / Gemini 自动分流走 Cloudflare WARP 解锁 `ZZ` 区域限制；内核级 TCP Keepalive（30s）+ Xray Keepalive（15s）缓解深度思考 `Broken Pipe` 断流；
 * **零泄露且不卡顿的本地配置**：实战验证的 `Fake-IP + geolocation-!cn + GEOIP,CN,DIRECT,no-resolve + UDP 443 阻断` 架构，彻底消除海外域名国内 DNS 泄露与 X / YouTube 卡顿；
-* **严谨的端到端客户端门禁**：免疫 `NO_PROXY` 环境变量干扰，从本机直测目标 VPS 入站 TCP 端口（及时发现云安全组拦截），精确比对实际出口 IP 等于本次部署的 VPS IP，并将单次代理 DNS 探针、Cloudflare 浏览器人机挑战与账号人工核验清晰分项报告。
+* **严谨的端到端客户端门禁**：免疫 `NO_PROXY` 环境变量干扰，从本机直测目标 VPS 入站 TCP 端口（及时发现云安全组拦截），通过 **HTTPS** 精确比对实际出口 IP（支持 NAT VPS 独立入站/出站 IP），并将单次代理 DNS 探针、Cloudflare 浏览器人机挑战与账号人工核验清晰分项报告。
 
 ---
 
@@ -22,7 +22,7 @@
 
 ```mermaid
 flowchart TD
-    Client["本地设备 (Mac / Windows / iOS / Android)<br/>Clash Verge Rev · 系统代理 + TUN 双开 / Fake-IP<br/>关闭公网 IPv6 + Chrome WebRTC Control"] -->|"VLESS Reality · XTLS-rprx-vision / Keepalive 15s"| VPS["全新海外独享原生 / 双ISP VPS<br/>Ubuntu 22.04+ / Debian 11+<br/>BBR + TCP Keepalive 30s + 禁用 IPv6"]
+    Client["本地设备 (Mac / Windows / iOS / Android)<br/>Clash Verge Rev · 系统代理 + TUN 双开 / Fake-IP<br/>关闭公网 IPv6 + Chrome WebRTC Control"] -->|"VLESS Reality · XTLS-rprx-vision / Keepalive 15s"| VPS["全新海外独享原生 / 双ISP VPS<br/>Ubuntu 22.04+ / Debian 11+<br/>非 root xray 服务 · BBR + Keepalive 30s + 禁 IPv6"]
 
     VPS -->|"Xray 内部精细分流"| Router{"双轨隔离路由引擎"}
     Router -->|"Claude / ChatGPT / Persona / Turnstile"| Direct["原生独享美区 IP<br/>极致防封 / 零污染"]
@@ -38,17 +38,25 @@ flowchart TD
 
 ### 第 1 步：准备前置物料
 1. **一台全新海外原生住宅 / 双 ISP VPS**（推荐默认 **Ubuntu 22.04+ 或 Debian 11+**；*注：Ubuntu 即“乌班图”，是业界最标准的轻量 Linux 服务器系统，切勿装成 Windows*）；
-2. 记录 VPS 的 **公网 IP 地址** 与 **SSH 端口号**（如暂未配置 SSH 免密公钥，部署时按 Agent 提示在自己本机终端执行一次 `ssh-copy-id` 即可，**无需也不建议把 root 密码发进聊天窗口**）；
+2. 记录 VPS 的 **公网 IP 地址**、**SSH 端口号** 与 **SSH 用户名**（`root` 或普通 `sudo` 用户如 `ubuntu`/`debian`；如暂未配置 SSH 免密公钥，部署时按 Agent 提示在自己本机终端执行一次 `ssh-copy-id` 即可，**无需也不建议把密码发进聊天窗口**）；
 3. 电脑端安装 **Clash Verge Rev**（手机端可选装 Shadowrocket / Sing-box / Loon）。
 
-### 第 2 步：让 Agent 加载本技能（二选一）
+### 第 2 步：按你的 AI Agent 安装全局 Skill（或直接发仓库链接）
 
-* **方式 A（安装为全局 Skill，推荐）**：
+* **Codex**：
+  ```bash
+  git clone https://github.com/BigDataScholar/claude-antiban-network.git ~/.codex/skills/claude-antiban-network
+  ```
+* **Claude Code**：
+  ```bash
+  git clone https://github.com/BigDataScholar/claude-antiban-network.git ~/.claude/skills/claude-antiban-network
+  ```
+* **Google Antigravity**：
   ```bash
   git clone https://github.com/BigDataScholar/claude-antiban-network.git ~/.gemini/config/skills/claude-antiban-network
   ```
-* **方式 B（直接发链接给任意 Agent）**：
-  直接将本 GitHub 仓库地址发给 Codex / Cursor / Claude Code / Antigravity，让它克隆并严格按仓库里的 `SKILL.md` 执行。
+* **Cursor 或其他任意 AI Agent**：
+  直接将本 GitHub 仓库地址（`https://github.com/BigDataScholar/claude-antiban-network`）发给 Agent，让它克隆到本地并严格按仓库中的 `SKILL.md` 执行。
 
 ### 第 3 步：一句话启动全自动部署
 
@@ -57,11 +65,11 @@ flowchart TD
 > **“我刚买了一台全新的海外 VPS，请严格按照 `claude-antiban-network` 技能的 `SKILL.md` 帮我全自动搭建防 Claude 封号的专属网络，并通过目标节点精确门禁验收。”**
 
 Agent 会自动牵引你走完完整闭环：
-1. **安全建连**：验证本机 SSH 密钥（或引导你在本地终端执行一次 `ssh-copy-id`），零明文密码进聊天；
-2. **远程部署**：在全新 VPS 上校验并安装固定版 Xray Reality + WARP 双轨分流 + 内核保活，严格放行本地防火墙并将节点元数据写入 `0600` 文件；
+1. **安全建连**：验证本机 SSH 密钥（或引导你在本地终端执行一次 `ssh-copy-id`），支持 `root` 与普通 `sudo` 用户，零明文密码进聊天；
+2. **远程部署**：在全新 VPS 上校验并安装固定版 Xray Reality + WARP 双轨分流 + 内核保活，严格校验本地防火墙后部署配置，并将节点元数据写入 `0600` 文件；
 3. **生成防漏配置**：通过 `scp` 拉取受限元数据文件，在桌面生成 `0600` 权限的 `Claude-独享纯美区配置.yaml` 与手机链接文件；
 4. **客户端与系统加固**：引导导入 Clash Verge、双开「系统代理 + TUN」、关闭本机公网 IPv6、配置浏览器 `WebRTC Control`；
-5. **端到端精确验收**：从本机直测目标 VPS 入站端口、精确核对代理出口 IP 等于本次部署 VPS、检查单次代理 DNS / 本机 IPv6 / Fake-IP，并明确列出需真实浏览器确认的 Turnstile 人机盾与账号登录项。
+5. **端到端精确验收**：从本机直测目标 VPS 入站端口、通过 HTTPS 精确核对代理出口 IP（支持 NAT VPS 独立入站/出站 IP）、检查单次代理 DNS / 本机 IPv6 / Fake-IP，并明确列出需真实浏览器确认的 Turnstile 人机盾与账号登录项。
 
 ---
 
@@ -114,17 +122,17 @@ Agent 会自动牵引你走完完整闭环：
 
 ```text
 claude-antiban-network/
-├── SKILL.md                          # AI Agent 全自动执行 SOP 与安全红线
-├── README.md                         # 项目介绍、3 步自动化启动与防封黄金法则
+├── SKILL.md                          # AI Agent 全自动执行 SOP 与安全红线（支持 root / sudo）
+├── README.md                         # 项目介绍、跨 Agent 安装与防封黄金法则
 ├── scripts/
-│   ├── vps_setup.sh                  # [VPS 端] 全新 VPS 预检 + SHA256 校验 Xray + WARP + 0600 配置部署
+│   ├── vps_setup.sh                  # [VPS 端] 全新预检 + SHA256 Xray + 0640/0600 权限 + 部署前防火墙回滚
 │   ├── generate_clash_config.py      # [本地端] 0600 文件交接生成防漏 Clash 配置与移动端 VLESS 链接
-│   └── verify_environment.py         # [本地端] 免疫 NO_PROXY 的端到端门禁验收脚本
+│   └── verify_environment.py         # [本地端] 免疫 NO_PROXY 的 HTTPS 端到端门禁脚本（含 NAT VPS）
 ├── templates/
 │   ├── xray_server.json.template     # Xray 服务端双轨配置参考模板
 │   └── clash_profile.yaml.template   # Clash Verge 客户端防漏配置参考模板
 └── tests/
-    └── test_suite.py                 # 零依赖 Python 回归测试套件（覆盖 5 项核心安全与一致性场景）
+    └── test_suite.py                 # 零依赖 Python 回归测试套件（覆盖 P0 上游安装器行为与全部安全场景）
 ```
 
 运行内置回归测试：

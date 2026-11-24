@@ -6,11 +6,13 @@ Hardened verification design:
 1. Immune to NO_PROXY / no_proxy environment variables via ForcedProxyHandler.
 2. Verifies direct client-to-VPS TCP port reachability first, localizing failures
    between cloud security group / VPS firewall vs. local Clash client config.
-3. Strictly matches observed egress IP against the deployed VPS IP (--node-json
-   or --expected-ip) so an unrelated US proxy cannot falsely pass the gate.
+3. Queries egress IP & geolocation strictly over HTTPS (no plaintext HTTP fallback)
+   and matches observed egress IP against the deployed VPS egress IP, with separate
+   --inbound-host and --expected-egress-ip flags for NAT VPS deployments.
 4. Separately reports:
-   - Automated Proxy Chain Hard Gates (VPS port, exact IP match + US, Anthropic API,
-     Gemini ZZ check, single-request proxy DNS probe, local IPv6, local Fake-IP)
+   - Automated Proxy Chain Hard Gates (VPS port, exact HTTPS egress IP match + US,
+     Anthropic API, Gemini ZZ check, single-request proxy DNS probe, local IPv6,
+     local Fake-IP)
    - Observed Browser Challenge Status (claude.ai HTTP 200 vs CF Turnstile Challenge vs 403 Block)
    - Manual Verification Items (account login usability, WebRTC, Scamalytics score)
 """
@@ -33,6 +35,11 @@ RED = "\033[91m"
 BLUE = "\033[94m"
 BOLD = "\033[1m"
 RESET = "\033[0m"
+
+HTTPS_GEO_ENDPOINTS = (
+    ("ipinfo.io", "https://ipinfo.io/json"),
+    ("api.ip.sb", "https://api.ip.sb/geoip"),
+)
 
 
 class ForcedProxyHandler(urllib.request.ProxyHandler):
@@ -69,52 +76,114 @@ def build_opener(proxy_url):
     return urllib.request.build_opener(handler)
 
 
-def check_vps_port_reachable(server_ip, port, timeout=5):
+def check_vps_port_reachable(inbound_host, port, timeout=5):
     try:
-        with socket.create_connection((server_ip, int(port)), timeout=timeout):
-            print(f"[{GREEN}PASS{RESET}] 客户端直连目标 VPS 入站端口可达: {server_ip}:{port}/tcp")
+        with socket.create_connection((inbound_host, int(port)), timeout=timeout):
+            print(f"[{GREEN}PASS{RESET}] 客户端直连目标 VPS 入站端口可达: {inbound_host}:{port}/tcp")
             return True
     except Exception as e:
-        print(f"[{RED}FAIL{RESET}] 客户端直连目标 VPS 入站端口不可达: {server_ip}:{port}/tcp ({e})")
+        print(f"[{RED}FAIL{RESET}] 客户端直连目标 VPS 入站端口不可达: {inbound_host}:{port}/tcp ({e})")
         print(f"       {YELLOW}故障定位 -> 请检查：(1) 云厂商控制台安全组/防火墙是否放行 TCP {port}；(2) VPS 本机 ufw/iptables 与 xray 服务监听状态。{RESET}")
         return False
 
 
-def test_ip_and_geo(opener, expected_ip=None, allow_any_us=False):
-    req = urllib.request.Request("http://ip-api.com/json", headers={"User-Agent": "curl/7.88.1"})
+def _normalize_geo_payload(provider, data):
+    """Normalize HTTPS GeoIP JSON from ipinfo.io or api.ip.sb."""
+    if not isinstance(data, dict):
+        return None
+    ip = (data.get("ip") or data.get("query") or "").strip()
+    if not ip:
+        return None
     try:
-        with opener.open(req, timeout=10) as resp:
-            data = json.loads(resp.read().decode())
-            ip = (data.get("query") or "").strip()
-            country = data.get("country")
-            country_code = data.get("countryCode")
-            isp = data.get("isp")
-            as_name = data.get("as")
+        ipaddress.ip_address(ip)
+    except ValueError:
+        return None
 
-            is_us = country_code == "US"
-            ip_matches = True if allow_any_us else (bool(expected_ip) and ip == expected_ip)
+    if provider == "ipinfo.io":
+        country_code = (data.get("country") or "").strip().upper()
+        country = data.get("country_name") or country_code
+        city = data.get("city") or ""
+        region = data.get("region") or ""
+        org = data.get("org") or ""
+        isp = org
+        as_name = org
+    else:
+        country_code = (data.get("country_code") or data.get("countryCode") or "").strip().upper()
+        country = data.get("country") or country_code
+        city = data.get("city") or ""
+        region = data.get("region") or ""
+        isp = data.get("isp") or data.get("organization") or ""
+        asn = data.get("asn")
+        as_org = data.get("asn_organization") or data.get("organization") or ""
+        as_name = f"AS{asn} {as_org}".strip() if asn else as_org
 
-            if is_us and ip_matches:
-                tag = f"{GREEN}PASS (US{' · 目标VPS精确匹配' if expected_ip else ''}){RESET}"
-            elif is_us and not expected_ip and not allow_any_us:
-                tag = f"{RED}FAIL (未指定目标VPS IP){RESET}"
-            elif is_us and expected_ip and ip != expected_ip:
-                tag = f"{RED}FAIL (出口IP不匹配){RESET}"
-            else:
-                tag = f"{RED}FAIL ({country_code}){RESET}"
+    location = ", ".join(part for part in (city, region) if part)
+    return {
+        "provider": provider,
+        "ip": ip,
+        "country": country,
+        "country_code": country_code,
+        "location": location,
+        "isp": isp,
+        "as_name": as_name,
+    }
 
-            print(f"[{tag}] 实际出口 IP: {ip}")
-            print(f"       物理位置 : {country} ({country_code}), {data.get('city', '')}")
-            print(f"       ISP / 归属: {isp} / {as_name}")
 
-            if expected_ip and ip != expected_ip:
-                print(f"       {RED}故障定位 -> 预期出口为本次部署的 VPS ({expected_ip})，但实际走了无关出口 ({ip})！请检查 Clash 当前选中的节点与策略组。{RESET}")
-            elif not expected_ip and not allow_any_us:
-                print(f"       {YELLOW}提示 -> 请传入 --node-json <0600文件> 或 --expected-ip <VPS_IP> 以确认流量经过本次部署的 VPS（仅显式指定 --allow-any-us 时才跳过比对）。{RESET}")
+def fetch_egress_geo_https(opener):
+    """Query egress IP and GeoIP strictly over HTTPS with HTTPS fallback."""
+    errors = []
+    for provider, url in HTTPS_GEO_ENDPOINTS:
+        req = urllib.request.Request(
+            url,
+            headers={"User-Agent": "curl/7.88.1", "Accept": "application/json"},
+        )
+        try:
+            with opener.open(req, timeout=10) as resp:
+                payload = json.loads(resp.read().decode("utf-8"))
+                normalized = _normalize_geo_payload(provider, payload)
+                if normalized and normalized["country_code"]:
+                    return normalized
+                errors.append(f"{provider}: incomplete JSON payload")
+        except Exception as e:
+            errors.append(f"{provider}: {e}")
+    raise RuntimeError("; ".join(errors))
 
-            return is_us, ip_matches, ip
+
+def test_ip_and_geo(opener, expected_egress_ip=None, allow_any_us=False):
+    try:
+        info = fetch_egress_geo_https(opener)
+        ip = info["ip"]
+        country = info["country"]
+        country_code = info["country_code"]
+        location = info["location"]
+        isp = info["isp"]
+        as_name = info["as_name"]
+        provider = info["provider"]
+
+        is_us = country_code == "US"
+        ip_matches = True if allow_any_us else (bool(expected_egress_ip) and ip == expected_egress_ip)
+
+        if is_us and ip_matches:
+            tag = f"{GREEN}PASS (US{' · 目标VPS精确匹配' if expected_egress_ip else ''}){RESET}"
+        elif is_us and not expected_egress_ip and not allow_any_us:
+            tag = f"{RED}FAIL (未指定目标VPS出口IP){RESET}"
+        elif is_us and expected_egress_ip and ip != expected_egress_ip:
+            tag = f"{RED}FAIL (出口IP不匹配){RESET}"
+        else:
+            tag = f"{RED}FAIL ({country_code}){RESET}"
+
+        print(f"[{tag}] 实际出口 IP (HTTPS · {provider}): {ip}")
+        print(f"       物理位置 : {country} ({country_code}){f', {location}' if location else ''}")
+        print(f"       ISP / 归属: {isp or 'N/A'}{f' / {as_name}' if as_name and as_name != isp else ''}")
+
+        if expected_egress_ip and ip != expected_egress_ip:
+            print(f"       {RED}故障定位 -> 预期出口为本次部署的 VPS ({expected_egress_ip})，但实际走了无关出口 ({ip})！请检查 Clash 当前选中的节点与策略组（若是 NAT VPS 入口与出口 IP 不同，请分别传入 --inbound-host 与 --expected-egress-ip）。{RESET}")
+        elif not expected_egress_ip and not allow_any_us:
+            print(f"       {YELLOW}提示 -> 请传入 --node-json <0600文件> 或 --expected-egress-ip <VPS出口IP> 以确认流量经过本次部署的 VPS（仅显式指定 --allow-any-us 时才跳过比对）。{RESET}")
+
+        return is_us, ip_matches, ip
     except Exception as e:
-        print(f"[{RED}FAIL{RESET}] 经本地代理获取出口 IP 失败: {e}")
+        print(f"[{RED}FAIL{RESET}] 经本地代理通过 HTTPS 获取出口 IP 失败: {e}")
         print(f"       {YELLOW}故障定位 -> 若上方 VPS 端口可达但此处失败，说明问题在本地 Clash 节点凭证（UUID/PublicKey/ShortId/SNI）、代理端口或规则配置。{RESET}")
         return False, False, None
 
@@ -158,7 +227,7 @@ def test_dns_leak(opener):
                 return False
             else:
                 print(f"[{GREEN}PASS{RESET}] 单次代理 DNS 探针上游解析器位于海外: {dns_ip} ({dns_geo})")
-                print(f"       范围说明: 本探针仅验证本次代理请求的解析路径，不代表系统全局或浏览器 WebRTC 完全无泄露。")
+                print("       范围说明: 本探针仅验证本次代理请求的解析路径，不代表系统全局或浏览器 WebRTC 完全无泄露。")
                 return True
     except Exception as e:
         print(f"[{YELLOW}UNVERIFIED{RESET}] 单次代理 DNS 探针请求失败 ({e})，请在 https://ip.net.coffee/claude 复核。")
@@ -285,15 +354,16 @@ def main():
     parser = argparse.ArgumentParser(description="Verify Claude Anti-Ban Network Environment")
     parser.add_argument("--proxy", default="http://127.0.0.1:7897", help="Local proxy URL (default: http://127.0.0.1:7897)")
     parser.add_argument("--node-json", help="Path to restricted (0600) node metadata JSON from vps_setup.sh (recommended)")
-    parser.add_argument("--expected-ip", help="Expected VPS IPv4 egress address")
+    parser.add_argument("--expected-ip", help="Shorthand for both inbound host and expected egress IP (dedicated VPS)")
+    parser.add_argument("--inbound-host", help="Inbound VPS host/IP for direct TCP port check (useful for NAT VPS)")
+    parser.add_argument("--expected-egress-ip", help="Expected outbound egress IPv4 address (useful for NAT VPS)")
     parser.add_argument("--expected-port", type=int, help="Expected VPS TCP inbound port for direct reachability check")
     parser.add_argument("--allow-any-us", action="store_true", help="Allow any US egress IP without verifying exact VPS match")
     parser.add_argument("--proxy-only", action="store_true", help="Skip hard requirement for TUN Fake-IP takeover (system-proxy-only mode)")
     parser.add_argument("--strict-web", action="store_true", help="Fail gate if claude.ai returns Cloudflare Turnstile Challenge (CF_CHALLENGE)")
     args = parser.parse_args()
 
-    expected_ip = args.expected_ip
-    expected_port = args.expected_port
+    node_meta = {}
     if args.node_json:
         node_path = os.path.expanduser(args.node_json)
         if not os.path.exists(node_path):
@@ -301,24 +371,28 @@ def main():
             sys.exit(1)
         with open(node_path, "r", encoding="utf-8") as f:
             node_meta = json.load(f)
-        expected_ip = expected_ip or node_meta.get("server_ip")
-        expected_port = expected_port or node_meta.get("port")
+
+    inbound_host = args.inbound_host or args.expected_ip or node_meta.get("server_ip")
+    expected_egress_ip = args.expected_egress_ip or args.expected_ip or node_meta.get("egress_ip") or node_meta.get("server_ip")
+    expected_port = args.expected_port or node_meta.get("port")
 
     print_header("Claude & AI Anti-Ban Network Environment Gate Check")
     print(f"代理入口 : {args.proxy} (强制走代理，已免疫 NO_PROXY/no_proxy)")
-    if expected_ip:
-        print(f"目标 VPS : {expected_ip}{f':{expected_port}' if expected_port else ''}")
+    if inbound_host:
+        print(f"入站目标 : {inbound_host}{f':{expected_port}' if expected_port else ''}")
+    if expected_egress_ip:
+        print(f"预期出口 : {expected_egress_ip}{' (NAT 独立出口)' if inbound_host and expected_egress_ip != inbound_host else ''}")
 
     # 0. Direct client-to-VPS TCP port check (localizes firewall/SG issues before proxy)
     port_ok = None
-    if expected_ip and expected_port:
-        port_ok = check_vps_port_reachable(expected_ip, expected_port)
+    if inbound_host and expected_port:
+        port_ok = check_vps_port_reachable(inbound_host, expected_port)
 
     opener = build_opener(args.proxy)
 
-    # 1. Exact Egress IP & Geo
+    # 1. Exact HTTPS Egress IP & Geo
     is_us, ip_matches, observed_ip = test_ip_and_geo(
-        opener, expected_ip=expected_ip, allow_any_us=args.allow_any_us
+        opener, expected_egress_ip=expected_egress_ip, allow_any_us=args.allow_any_us
     )
 
     # 2. Single-Request Proxy DNS Probe
@@ -339,15 +413,15 @@ def main():
     print_header("验收结果分类报告")
     print(f"{BOLD}[A] 自动化网络链路门禁 (Hard Gates):{RESET}")
     gate_checks = []
-    if expected_ip and expected_port:
-        gate_checks.append(("目标 VPS 入站 TCP 端口可达", port_ok is True, f"{expected_ip}:{expected_port} 不可达（请检查云安全组/VPS防火墙）"))
+    if inbound_host and expected_port:
+        gate_checks.append(("目标 VPS 入站 TCP 端口可达", port_ok is True, f"{inbound_host}:{expected_port} 不可达（请检查云安全组/VPS防火墙）"))
     if args.allow_any_us:
-        gate_checks.append(("出口 IP 归属美国 (US)", is_us is True, "出口 IP 非美国或未能识别"))
+        gate_checks.append(("HTTPS 出口 IP 归属美国 (US)", is_us is True, "出口 IP 非美国或未能识别"))
     else:
         gate_checks.append((
-            "出口 IP 精确匹配本次部署 VPS 且为 US",
+            "HTTPS 出口 IP 精确匹配目标 VPS 且为 US",
             is_us is True and ip_matches is True,
-            f"未匹配目标 VPS ({expected_ip or '未指定'})，实际出口: {observed_ip or '无'}",
+            f"未匹配目标出口 ({expected_egress_ip or '未指定'})，实际出口: {observed_ip or '无'}",
         ))
     gate_checks.append(("Anthropic API 网关直达", api_reachable is True, "api.anthropic.com 连接失败或被 403 拦截"))
     if args.strict_web:

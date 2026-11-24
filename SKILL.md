@@ -3,8 +3,8 @@ name: claude-antiban-network
 description: >-
   纯 AI Agent 全自动化防封网络搭建技能套件（兼容 Codex / Antigravity / Cursor / Claude Code）。
   用于将【全新】海外原生住宅/双ISP VPS（Debian 11+ / Ubuntu 22.04+）全自动部署为防 Claude / ChatGPT 封号的高纯净独享网络环境，
-  采用 SSH 密钥免密 + 0600 文件凭证交接（密码与 UUID 绝不进入聊天/命令历史）、SHA256 校验固定版本 Xray VLESS Reality、
-  Cloudflare WARP 双轨分流、严格防火墙与客户端入站实测、精确出口 IP 比对与本地防泄露门禁验收。
+  采用 SSH 密钥免密 + 0600 文件凭证交接（支持 root 与普通用户 sudo，密码与密钥绝不进入聊天/命令参数）、SHA256 校验固定版本 Xray VLESS Reality、
+  非 root xray 服务最小权限、Cloudflare WARP 双轨分流、部署前防火墙校验与失败回滚、HTTPS 出口 IP 精确比对（含 NAT VPS）与本地防泄露门禁验收。
 ---
 
 # Claude 防封网络全自动化搭建技能 (claude-antiban-network)
@@ -17,20 +17,22 @@ description: >-
 
 1. **默认仅支持全新 VPS（防误伤存量服务）**：
    * `scripts/vps_setup.sh` 会在执行任何 `apt` / `sysctl` / Xray / WARP 改动**之前**检查是否已存在 Xray 或 WARP。若检出已有环境，立即退出（exit 2）且零修改；
-   * 仅当用户在维护窗口明确确认覆盖时，才允许传入 `ALLOW_EXISTING=true`（如需同时轮换凭证，传 `ALLOW_EXISTING=true REGENERATE=true`）。
+   * 仅当用户在维护窗口明确确认覆盖，或系上次安装中途失败修复后重试时，才允许传入 `ALLOW_EXISTING=true`（如需同时轮换凭证，传 `ALLOW_EXISTING=true REGENERATE=true`）。
 2. **零凭证泄露（绝不向用户索要明文密码进聊天！）**：
-   * **禁止**让用户在聊天窗口粘贴 VPS `root` 密码；
+   * **禁止**让用户在聊天窗口粘贴 VPS SSH/sudo 密码；
    * **优先使用本机已有 SSH 密钥 / `ssh-agent`**；若 VPS 仅开通了密码登录，请给用户一行 `ssh-copy-id` 命令，让用户在**自己本机终端亲自输入密码**推上公钥后再交由 Agent 免密接管；
-   * **禁止**将含 UUID / PrivateKey 的 JSON 拼进命令行参数，也**禁止**把原始 `vless://` 链接打印到聊天记录；节点凭证全程通过 `0600` 权限文件交接（VPS `/root/claude-antiban-node.json` ➔ `scp` ➔ 本机 `~/.claude-antiban/node.json`）。
-3. **固定版本与校验和**：
-   * `vps_setup.sh` 已固定经验证的官方 `XTLS/Xray-install` commit SHA、脚本 SHA256 校验和及 Xray-core 版本（`v26.11.9`），不再盲跑上游漂移 `main` 分支。
-4. **必须从客户端实测入站端口与精确出口 IP**：
-   * 服务端脚本放行 UFW / firewalld / iptables 失败时会直接报错中止（不吞错），但**云厂商控制台安全组独立于 VPS 防火墙**；
-   * 验收时必须传入 `--node-json ~/.claude-antiban/node.json`，从本机直连验证 `<VPS_IP>:<PORT>` 入站可达，并精确比对代理出口 IP 等于本次部署的 `<VPS_IP>`。
+   * **禁止**将含 UUID / PrivateKey 的 JSON 拼进命令行参数，也**禁止**把原始 `vless://` 链接打印到聊天记录；节点凭证全程通过 `0600` 权限文件交接（VPS 元数据文件 ➔ `scp` ➔ 本机 `~/.claude-antiban/node.json`）。
+3. **固定供应链版本与最小权限服务账号**：
+   * `vps_setup.sh` 已固定经验证的官方 `XTLS/Xray-install` commit SHA、脚本 SHA256 校验和及 Xray-core 版本（`v26.11.9`）；
+   * 保留上游非 root `User=xray` systemd 服务账号（`/usr/local/etc/xray` 为 `0750 root:xray`，`config.json` 为 `0640 root:xray`，备份与节点元数据严格 `0600`）；
+   * 服务端全程通过标准输入（`openssl pkey` / `jq` stdin）处理密钥与凭证，不将私钥或 UUID 传入子进程命令行参数。
+4. **必须从客户端实测入站端口与 HTTPS 精确出口 IP**：
+   * 服务端脚本在覆盖 `config.json` 与重启 Xray **之前**校验 UFW / firewalld / iptables，失败会回滚临时配置与 `sysctl` 并中止（绝不假报成功）；但**云厂商控制台安全组独立于 VPS 防火墙**；
+   * 验收时必须传入 `--node-json ~/.claude-antiban/node.json`，从本机直连验证入站 TCP 端口可达，并通过 **HTTPS**（非明文 HTTP）精确比对代理出口 IP 等于本次部署的 VPS 出口 IP（NAT VPS 入口/出口不同时使用 `--inbound-host` + `--expected-egress-ip`）。
 
 ```mermaid
 flowchart TD
-    Client["本地设备 (Mac / Windows / iOS / Android)<br/>Clash Verge Rev · 系统代理 + TUN 双开 / Fake-IP<br/>禁用公网 IPv6 + Chrome WebRTC Control"] -->|"VLESS Reality · XTLS-rprx-vision / Keepalive 15s"| VPS["全新海外独享原生 / 双ISP VPS<br/>Ubuntu 22.04+ / Debian 11+<br/>BBR + TCP Keepalive 30s + 禁用 IPv6"]
+    Client["本地设备 (Mac / Windows / iOS / Android)<br/>Clash Verge Rev · 系统代理 + TUN 双开 / Fake-IP<br/>禁用公网 IPv6 + Chrome WebRTC Control"] -->|"VLESS Reality · XTLS-rprx-vision / Keepalive 15s"| VPS["全新海外独享原生 / 双ISP VPS<br/>Ubuntu 22.04+ / Debian 11+<br/>非 root xray 服务 · BBR + Keepalive 30s + 禁 IPv6"]
 
     VPS -->|"Xray 精细路由"| Router{"双轨隔离引擎"}
     Router -->|"Claude / ChatGPT / Persona / Turnstile"| Direct["原生独享美区 IP<br/>极致防封 / 零污染"]
@@ -42,10 +44,10 @@ flowchart TD
 
 ## 目录结构
 
-* `scripts/vps_setup.sh`：VPS 端部署脚本（全新 VPS 预检、SHA256 校验固定 Xray 版本、WARP 优雅降级、0600 服务端配置与备份、严格防火墙校验、从最终活跃 `config.json` 生成 `0600` 元数据文件）。
+* `scripts/vps_setup.sh`：VPS 端部署脚本（全新 VPS 预检、SHA256 校验固定 Xray 版本、自动识别上游 `{}` 空配置占位、保留非 root `xray` 服务账号 `0640 root:xray` 配置权限、stdin 零参数泄露密钥派生、部署前防火墙校验与失败回滚、从最终活跃 `config.json` 生成 `0600` 元数据文件，支持 `OUTPUT_OWNER` 供非 root `sudo` 用户拉取）。
 * `scripts/generate_clash_config.py`：本地配置生成器（从 `0600` 文件读取节点元数据，生成 `0600` 防漏 Clash YAML 与 `0600` 移动端 VLESS 链接文件，支持合法空 `short_id`）。
-* `scripts/verify_environment.py`：客户端端到端门禁脚本（免疫 `NO_PROXY`、直测 VPS 入站端口、精确比对目标 VPS 出口 IP、单次代理 DNS 探针、Anthropic API/Web 分离报告、Gemini ZZ、本机 IPv6 与 Fake-IP 门禁）。
-* `tests/test_suite.py`：内置零依赖 Python 回归测试套件（覆盖预检、防火墙失败传播、0600 权限、空 shortId 复用、凭证轮换、NO_PROXY 免疫与出口 IP 精确比对）。
+* `scripts/verify_environment.py`：客户端端到端门禁脚本（免疫 `NO_PROXY`、直测 VPS 入站端口、HTTPS 出口 IP 精确比对且支持 NAT VPS 独立入站/出站 IP、单次代理 DNS 探针、Anthropic API/Web 分离报告、Gemini ZZ、本机 IPv6 与 Fake-IP 门禁）。
+* `tests/test_suite.py`：内置零依赖 Python 回归测试套件。
 
 ---
 
@@ -54,19 +56,19 @@ flowchart TD
 ### 第 1 步：采集目标信息并建立免密 SSH（零密码进聊天）
 
 向用户确认以下**非敏感连接信息**：
-1. **VPS 公网 IPv4 地址**（确认是全新 Debian 11+ / Ubuntu 22.04+ VPS）
-2. **SSH 端口号**（如主机商提供的自定义高位端口）
-3. **SSH 用户名**（通常为 `root`）
+1. **VPS 公网 IPv4 地址**（确认是全新 Debian 11+ / Ubuntu 22.04+ VPS；若为 NAT VPS，一并确认出口 IP）
+2. **SSH 端口号**（如主机商提供的自定义高位端口，默认 `22`）
+3. **SSH 用户名**（`root` 或普通 `sudo` 用户，如 AWS/GCP/Azure 常见的 `ubuntu` / `debian`）
 
 **建立安全 SSH 连接（严禁要求用户在聊天框发密码）**：
 1. Agent 先测试本机已有 SSH 密钥 / `ssh-agent` 能否直接连通：
    ```bash
-   ssh -o BatchMode=yes -o ConnectTimeout=5 -p <SSH_PORT> root@<VPS_IP> "echo SSH_KEY_OK"
+   ssh -o BatchMode=yes -o ConnectTimeout=5 -p <SSH_PORT> <SSH_USER>@<VPS_IP> "echo SSH_KEY_OK"
    ```
 2. 若尚未配置免密密钥，请引导用户在**自己本机终端**运行一次授权命令（密码仅由用户本人在本地终端输入，不经过 Agent）：
    ```bash
    # 若本机尚无公钥先执行：ssh-keygen -t ed25519 -f ~/.ssh/id_ed25519
-   ssh-copy-id -p <SSH_PORT> root@<VPS_IP>
+   ssh-copy-id -p <SSH_PORT> <SSH_USER>@<VPS_IP>
    ```
 3. 待用户完成后，复测 `BatchMode=yes` 确认免密通道就绪。
 
@@ -74,6 +76,9 @@ flowchart TD
 
 ### 第 2 步：远程部署 VPS 并通过 `0600` 文件回收节点元数据
 
+根据 `<SSH_USER>` 选择对应分支：
+
+#### 模式 A：直接以 `root` 登录的 VPS
 ```bash
 # 1. 上传并执行服务端部署脚本（默认仅允许全新 VPS；不向终端吐出敏感凭证）
 scp -P <SSH_PORT> <skill-path>/scripts/vps_setup.sh root@<VPS_IP>:/tmp/vps_setup.sh
@@ -85,8 +90,24 @@ scp -P <SSH_PORT> root@<VPS_IP>:/root/claude-antiban-node.json ~/.claude-antiban
 chmod 600 ~/.claude-antiban/node.json
 ```
 
-* 若 `vps_setup.sh` 退出码为 `2`：说明目标 VPS 已有旧 Xray/WARP，向用户汇报并确认是否要显式启用 `ALLOW_EXISTING=true`（或换一台全新 VPS）。
-* 若防火墙步骤报错退出：直接告知用户具体失败项，切勿假装部署成功。
+#### 模式 B：普通用户 + `sudo` 登录的 VPS（如 AWS / GCP / Azure 的 `ubuntu` / `debian`）
+```bash
+# 1. 上传脚本并以 sudo 执行，通过 OUTPUT_FILE + OUTPUT_OWNER 生成仅当前 SSH 用户可读的 0600 文件
+scp -P <SSH_PORT> <skill-path>/scripts/vps_setup.sh <SSH_USER>@<VPS_IP>:/tmp/vps_setup.sh
+ssh -p <SSH_PORT> <SSH_USER>@<VPS_IP> \
+  "sudo OUTPUT_FILE=/tmp/claude-antiban-node.json OUTPUT_OWNER=\$USER bash /tmp/vps_setup.sh && rm -f /tmp/vps_setup.sh"
+# 注：若远端 sudo 需要输入密码，请改为引导用户在自己本机终端加 `ssh -t` 执行，勿在聊天收集密码
+
+# 2. 通过 scp 拉取 0600 元数据文件，并立即删除远端 /tmp 临时凭证文件
+mkdir -p -m 700 ~/.claude-antiban
+scp -P <SSH_PORT> <SSH_USER>@<VPS_IP>:/tmp/claude-antiban-node.json ~/.claude-antiban/node.json
+chmod 600 ~/.claude-antiban/node.json
+ssh -p <SSH_PORT> <SSH_USER>@<VPS_IP> "rm -f /tmp/claude-antiban-node.json"
+```
+
+* **退出码处理**：
+  * 若 `vps_setup.sh` 退出码为 `2`：说明目标 VPS 已有旧 Xray/WARP，向用户汇报并确认是否要显式启用 `ALLOW_EXISTING=true`（或换一台全新 VPS）。
+  * 若防火墙或启动步骤报错退出：脚本已自动回滚临时配置与 `sysctl`（不覆盖原 `config.json`）；请直接告知用户具体失败项，修复后可带 `ALLOW_EXISTING=true` 重试，切勿假装部署成功。
 
 ---
 
@@ -119,19 +140,27 @@ python3 <skill-path>/scripts/generate_clash_config.py \
 
 ---
 
-### 第 5 步：客户端端到端门禁验收（精确比对目标 VPS）
+### 第 5 步：客户端端到端门禁验收（HTTPS 精确比对目标 VPS）
 
 待用户启动 Clash Verge 后，**必须传入 `--node-json ~/.claude-antiban/node.json`** 运行门禁验收：
 
 ```bash
+# 标准独享公网 IP VPS：
 python3 <skill-path>/scripts/verify_environment.py \
   --proxy http://127.0.0.1:7897 \
   --node-json ~/.claude-antiban/node.json
+
+# 若为 NAT VPS（入站地址与出站公网 IP 不同）：
+python3 <skill-path>/scripts/verify_environment.py \
+  --proxy http://127.0.0.1:7897 \
+  --node-json ~/.claude-antiban/node.json \
+  --inbound-host <NAT_INBOUND_HOST> \
+  --expected-egress-ip <NAT_EGRESS_IP>
 ```
 
 **按故障定位结果闭环处理**：
 * **入站 TCP 端口不可达**：定位为**云厂商控制台安全组 / VPS 防火墙**未放行该端口 ➔ 引导用户在云控制台放行 TCP 端口后重测；
-* **端口可达但出口 IP 不匹配**：定位为 Clash 未选中新节点或代理端口不对 ➔ 检查 Clash 策略组；
+* **端口可达但出口 IP 不匹配**：定位为 Clash 未选中新节点、代理端口不对，或 NAT VPS 未分别指定 `--inbound-host` 与 `--expected-egress-ip`；
 * **检出本机公网 IPv6 绕行**：
   * **macOS**：`系统设置 ➔ 网络 ➔ Wi-Fi ➔ 详细信息 ➔ TCP/IP ➔ 配置 IPv6` 改为 **「仅本地链接」**；
   * **Windows**：网络适配器属性取消勾选 `Internet 协议版本 6 (TCP/IPv6)`；

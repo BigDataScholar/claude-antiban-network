@@ -4,13 +4,20 @@
 # Hardened Production Design:
 # 1. Preflight guard: defaults to FRESH VPS only (aborts before any mutation if
 #    existing Xray or WARP is detected unless ALLOW_EXISTING=true is explicitly set).
-# 2. Pinned, SHA256-verified Xray installer & Xray-core release version.
-# 3. Strict 0600 permissions on config, backups, and node metadata at creation time.
-# 4. Zero split-brain credentials: supports valid empty Reality shortId ("") and
+# 2. Pinned, SHA256-verified Xray installer & Xray-core release version
+#    (compatible with upstream non-root User=xray systemd unit; no removed -u flag).
+# 3. Handles upstream installer's empty {} config.json stub cleanly as a fresh install.
+# 4. Least-privilege permissions at creation time:
+#    - /usr/local/etc/xray (0750 root:xray) & config.json (0640 root:xray) so the
+#      non-root xray service user can read config while blocking world access.
+#    - Backups & node metadata strictly 0600 (supports OUTPUT_OWNER for sudo SCP).
+# 5. Zero secret exposure in child-process CLI args or error stderr:
+#    - Derives X25519 PublicKey via stdin-only openssl pkey (RFC 7748).
+#    - Passes sensitive fields to jq via stdin / config file, never CLI --arg.
+# 6. Firewall enforcement BEFORE overwriting config.json or restarting Xray,
+#    with full rollback (config + sysctl + service) and clear retry path.
+# 7. Zero split-brain credentials: supports valid empty Reality shortId ("") and
 #    derives delivered metadata strictly from the final active config.json.
-# 5. Loud firewall enforcement (no silent || true swallowing UFW/iptables errors)
-#    plus local listening-port check.
-# 6. No raw secrets printed to stdout by default (handoff via 0600 file).
 # ==============================================================================
 
 set -euo pipefail
@@ -34,6 +41,8 @@ Environment variables:
   ALLOW_EXISTING=true  Permit running on a VPS that already has Xray/WARP
   REGENERATE=true      Rotate UUID, Reality keys, and shortId (requires ALLOW_EXISTING=true if existing)
   OUTPUT_FILE          Path for 0600 node metadata JSON (default: /root/claude-antiban-node.json)
+  OUTPUT_OWNER         Optional owner for 0600 OUTPUT_FILE (for non-root sudo SCP handoff)
+  XRAY_GROUP           Optional service group for 0640 config.json (auto-detected: xray)
   XRAY_VERSION         Pinned Xray-core version (default: v26.11.9)
 USAGE
             exit 0
@@ -65,11 +74,18 @@ CONFIG_DIR="${CONFIG_DIR:-/usr/local/etc/xray}"
 EXISTING_CONFIG="${CONFIG_DIR}/config.json"
 SYSCTL_FILE="${SYSCTL_FILE:-/etc/sysctl.d/99-claude-antiban.conf}"
 OUTPUT_FILE="${OUTPUT_FILE:-/root/claude-antiban-node.json}"
+OUTPUT_OWNER="${OUTPUT_OWNER:-}"
+XRAY_GROUP="${XRAY_GROUP:-}"
+
+# Auto-assign OUTPUT_OWNER to SUDO_USER when writing outside /root under sudo
+if [ -z "$OUTPUT_OWNER" ] && [ -n "${SUDO_USER:-}" ] && [ "${SUDO_USER}" != "root" ] && [[ "$OUTPUT_FILE" != /root/* ]]; then
+    OUTPUT_OWNER="$SUDO_USER"
+fi
 
 # Pinned official XTLS/Xray-install commit & SHA256 checksum
 XRAY_INSTALL_COMMIT="${XRAY_INSTALL_COMMIT:-9d3ad49a3294d4c1d042f1fb6a16360b4d1befd1}"
 XRAY_INSTALL_SHA256="${XRAY_INSTALL_SHA256:-91fd40e9b6f222b5819f3ba91f0bfb4bb8c4d425a7c0ffe9d8b155d25ed79609}"
-XRAY_INSTALL_URL="https://raw.githubusercontent.com/XTLS/Xray-install/${XRAY_INSTALL_COMMIT}/install-release.sh"
+XRAY_INSTALL_URL="${XRAY_INSTALL_URL:-https://raw.githubusercontent.com/XTLS/Xray-install/${XRAY_INSTALL_COMMIT}/install-release.sh}"
 XRAY_VERSION="${XRAY_VERSION:-v26.11.9}"
 
 # Color Codes
@@ -82,17 +98,105 @@ log_info() { echo -e "${GREEN}[INFO]${NC} $1"; }
 log_warn() { echo -e "${YELLOW}[WARN]${NC} $1"; }
 log_error() { echo -e "${RED}[ERROR]${NC} $1" >&2; }
 
-# Helper: derive PublicKey from PrivateKey across legacy & Xray v26+ formats
-derive_public_key() {
+# Helper: derive X25519 PublicKey from raw base64url PrivateKey via stdin ONLY
+# (RFC 7748; zero secrets ever passed in child-process CLI argv!)
+derive_public_key_stdin() {
     local priv="$1"
-    local out
-    out=$("$XRAY_BIN" x25519 -i "$priv" 2>/dev/null || true)
-    echo "$out" | grep -iE "(public key|publickey|password)" | head -n 1 | awk -F': ' '{print $2}' | tr -d ' \r\n'
+    local b64="${priv//-/+}"
+    b64="${b64//_//}"
+    case $(( ${#b64} % 4 )) in
+        2) b64="${b64}==" ;;
+        3) b64="${b64}=" ;;
+    esac
+
+    local byte_len
+    byte_len=$(printf '%s' "$b64" | openssl base64 -d -A 2>/dev/null | wc -c | tr -d ' ')
+    if [ "${byte_len:-0}" -ne 32 ]; then
+        return 1
+    fi
+
+    # PKCS#8 X25519 header: 302e020100300506032b656e04220420 (octal for POSIX safety)
+    local derived
+    derived=$({
+        printf '\060\056\002\001\000\060\005\006\003\053\145\156\004\042\004\040'
+        printf '%s' "$b64" | openssl base64 -d -A 2>/dev/null
+    } | openssl pkey -inform DER -pubout -outform DER 2>/dev/null \
+      | tail -c 32 \
+      | openssl base64 -A 2>/dev/null \
+      | tr '+/' '-_' \
+      | tr -d '=\r\n')
+
+    if [ -z "$derived" ]; then
+        return 1
+    fi
+    printf '%s' "$derived"
+}
+
+# Helper: detect non-root xray service group (must be called AFTER Step 2 installs xray)
+detect_xray_group() {
+    if [ "$XRAY_GROUP" = "none" ]; then
+        printf '%s' ""
+        return 0
+    fi
+    if [ -n "$XRAY_GROUP" ]; then
+        printf '%s' "$XRAY_GROUP"
+        return 0
+    fi
+    if command -v getent >/dev/null 2>&1 && getent group xray >/dev/null 2>&1; then
+        printf '%s' "xray"
+        return 0
+    fi
+    if [ -f "$EXISTING_CONFIG" ]; then
+        local grp
+        grp=$(stat -c '%G' "$EXISTING_CONFIG" 2>/dev/null || stat -f '%Sg' "$EXISTING_CONFIG" 2>/dev/null || true)
+        if [ -n "$grp" ] && [ "$grp" != "root" ] && [ "$grp" != "wheel" ] && [ "$grp" != "UNKNOWN" ]; then
+            printf '%s' "$grp"
+            return 0
+        fi
+    fi
+    printf '%s' ""
+}
+
+# Helper: apply least-privilege directory & file permissions for Xray config
+apply_config_dir_perms() {
+    local dir="$1"
+    local grp="$2"
+    mkdir -p "$dir"
+    if [ -n "$grp" ]; then
+        if [ "$(id -u)" -eq 0 ]; then
+            chown "0:${grp}" "$dir"
+            chmod 750 "$dir"
+        elif chgrp "$grp" "$dir" 2>/dev/null; then
+            chmod 750 "$dir"
+        else
+            chmod 700 "$dir"
+        fi
+    else
+        chmod 700 "$dir"
+    fi
+}
+
+apply_config_file_perms() {
+    local file="$1"
+    local grp="$2"
+    if [ -n "$grp" ]; then
+        if [ "$(id -u)" -eq 0 ]; then
+            chown "0:${grp}" "$file"
+            chmod 640 "$file"
+        elif chgrp "$grp" "$file" 2>/dev/null; then
+            chmod 640 "$file"
+        else
+            chmod 600 "$file"
+        fi
+    else
+        chmod 600 "$file"
+    fi
 }
 
 # Helper: atomic write with strict 0600 permissions before content is written
 write_secret_file_0600() {
     local target="$1"
+    local owner="${2:-}"
     local parent
     parent=$(dirname "$target")
     mkdir -p "$parent"
@@ -102,6 +206,9 @@ write_secret_file_0600() {
         cat > "$tmp"
     )
     chmod 600 "$tmp"
+    if [ -n "$owner" ] && [ "$(id -u)" -eq 0 ]; then
+        chown "${owner}:${owner}" "$tmp" 2>/dev/null || chown "${owner}" "$tmp"
+    fi
     mv "$tmp" "$target"
     chmod 600 "$target"
 }
@@ -110,7 +217,12 @@ write_secret_file_0600() {
 # 0. Strict Preflight Checks (BEFORE ANY SYSTEM MUTATION!)
 # ------------------------------------------------------------------------------
 if [ "$SKIP_ROOT_CHECK" != "true" ] && [ "$(id -u)" -ne 0 ]; then
-    log_error "This script must be run as root!"
+    log_error "This script must be run as root (or via sudo)!"
+    exit 1
+fi
+
+if [ -n "$OUTPUT_OWNER" ] && ! id "$OUTPUT_OWNER" >/dev/null 2>&1; then
+    log_error "Invalid OUTPUT_OWNER user: ${OUTPUT_OWNER}"
     exit 1
 fi
 
@@ -119,9 +231,15 @@ if [ "$SKIP_APT" != "true" ] && ! command -v apt-get >/dev/null 2>&1; then
     exit 1
 fi
 
+# Record preexisting config BEFORE Step 2 installer runs (upstream installer creates empty {})
+HAD_PREEXISTING_CONFIG=false
+if [ -f "$EXISTING_CONFIG" ]; then
+    HAD_PREEXISTING_CONFIG=true
+fi
+
 # Detect existing Xray or WARP installation before touching anything
 EXISTING_DETECTED=()
-if [ -f "$EXISTING_CONFIG" ]; then
+if [ "$HAD_PREEXISTING_CONFIG" = "true" ]; then
     EXISTING_DETECTED+=("config:${EXISTING_CONFIG}")
 fi
 if [ -x "$XRAY_BIN" ] && [ "$SKIP_XRAY_INSTALL" != "true" ]; then
@@ -145,7 +263,7 @@ if [ "${#EXISTING_DETECTED[@]}" -gt 0 ] && [ "$ALLOW_EXISTING" != "true" ]; then
     log_error "        ${EXISTING_DETECTED[*]}"
     log_error "为避免意外中断运行中的服务或覆盖现有配置，本脚本默认仅支持【全新 VPS】。"
     log_error "未对系统做任何修改，已安全退出。"
-    log_error "如确认在维护窗口内覆盖更新，请显式设置 ALLOW_EXISTING=true 后重试。"
+    log_error "如确认在维护窗口内覆盖更新，或系上次安装失败修复后重试，请设置 ALLOW_EXISTING=true。"
     log_error "如需同时轮换全部节点凭证，请设置 ALLOW_EXISTING=true REGENERATE=true。"
     log_error "====================================================================="
     exit 2
@@ -183,6 +301,7 @@ done
 # ------------------------------------------------------------------------------
 # 2. Install Pinned, Checksum-Verified Xray-core
 # ------------------------------------------------------------------------------
+XRAY_INSTALLED_BY_US=false
 if [ "$SKIP_XRAY_INSTALL" != "true" ]; then
     log_info "Step 2: Downloading pinned Xray installer (commit ${XRAY_INSTALL_COMMIT:0:10}, Xray ${XRAY_VERSION})..."
     INSTALLER_TMP=$(mktemp /tmp/xray-install.XXXXXX.sh)
@@ -207,7 +326,9 @@ if [ "$SKIP_XRAY_INSTALL" != "true" ]; then
     fi
     log_info "Xray installer SHA256 verified."
 
-    bash "$INSTALLER_TMP" install -u root --version "$XRAY_VERSION"
+    # Pinned XTLS/Xray-install removed -u; keep upstream non-root User=xray service unit!
+    bash "$INSTALLER_TMP" install --version "$XRAY_VERSION"
+    XRAY_INSTALLED_BY_US=true
     rm -f "$INSTALLER_TMP"
 else
     log_info "Step 2: Skipping Xray binary installation (SKIP_XRAY_INSTALL=true)."
@@ -217,6 +338,14 @@ fi
 if [ ! -x "$XRAY_BIN" ]; then
     log_error "Xray binary not found or not executable at ${XRAY_BIN}!"
     exit 1
+fi
+
+# Detect service group AFTER Step 2 has created the xray user/group
+ACTIVE_XRAY_GROUP=$(detect_xray_group)
+if [ -n "$ACTIVE_XRAY_GROUP" ]; then
+    log_info "Detected Xray service group: ${ACTIVE_XRAY_GROUP} (config.json will use 0640 root:${ACTIVE_XRAY_GROUP})."
+else
+    log_info "No dedicated Xray service group detected (config.json will use strict 0600)."
 fi
 
 # ------------------------------------------------------------------------------
@@ -235,7 +364,21 @@ EXISTING_SHORT_IDS=""
 EXTRA_INBOUNDS=""
 REUSED_CREDENTIALS=false
 
-if [ -f "$EXISTING_CONFIG" ]; then
+# Upstream XTLS/Xray-install creates an empty "{}" config.json stub on fresh VPS.
+# Treat an empty "{}" stub (or absent config) as a fresh install, NEVER as a broken existing node.
+IS_EMPTY_STUB=false
+if [ -f "$EXISTING_CONFIG" ] && jq -e 'type == "object" and (keys | length == 0)' "$EXISTING_CONFIG" >/dev/null 2>&1; then
+    IS_EMPTY_STUB=true
+fi
+
+TREAT_AS_EXISTING=false
+if [ -f "$EXISTING_CONFIG" ] && [ "$IS_EMPTY_STUB" != "true" ]; then
+    TREAT_AS_EXISTING=true
+elif [ "$IS_EMPTY_STUB" = "true" ]; then
+    log_info "Detected empty '{}' config.json stub (upstream installer default); proceeding as fresh installation."
+fi
+
+if [ "$TREAT_AS_EXISTING" = "true" ]; then
     EXTRA_INBOUNDS=$(jq -c '.inbounds[1:] // empty' "$EXISTING_CONFIG" 2>/dev/null || true)
     EXISTING_PORT=$(jq -r '.inbounds[0].port // empty' "$EXISTING_CONFIG" 2>/dev/null || true)
     EXISTING_SNI=$(jq -r '.inbounds[0].streamSettings.realitySettings.serverNames[0] // empty' "$EXISTING_CONFIG" 2>/dev/null || true)
@@ -265,7 +408,7 @@ if [ -f "$EXISTING_CONFIG" ]; then
         fi
 
         if [ -n "$PRIVATE_KEY" ]; then
-            PUBLIC_KEY=$(derive_public_key "$PRIVATE_KEY")
+            PUBLIC_KEY=$(derive_public_key_stdin "$PRIVATE_KEY" || true)
         fi
 
         # Refuse partial reuse that could cause split-brain between clients/shortIds and privateKey
@@ -292,12 +435,11 @@ if [ "$REUSED_CREDENTIALS" != "true" ]; then
     SHORT_ID=$(openssl rand -hex 8)
 
     X25519_OUTPUT=$("$XRAY_BIN" x25519)
-    PRIVATE_KEY=$(echo "$X25519_OUTPUT" | grep -iE "(private key|privatekey)" | head -n 1 | awk -F': ' '{print $2}' | tr -d ' \r\n')
-    PUBLIC_KEY=$(echo "$X25519_OUTPUT" | grep -iE "(public key|publickey|password)" | head -n 1 | awk -F': ' '{print $2}' | tr -d ' \r\n')
+    PRIVATE_KEY=$(printf '%s\n' "$X25519_OUTPUT" | grep -iE "(private key|privatekey)" | head -n 1 | awk -F': ' '{print $2}' | tr -d ' \r\n' || true)
+    PUBLIC_KEY=$(printf '%s\n' "$X25519_OUTPUT" | grep -iE "(public key|publickey|password)" | head -n 1 | awk -F': ' '{print $2}' | tr -d ' \r\n' || true)
 
     if [ -z "$PRIVATE_KEY" ] || [ -z "$PUBLIC_KEY" ] || [ -z "$UUID" ] || [ -z "$SHORT_ID" ]; then
-        log_error "Failed to generate valid Xray Reality keys! Output was:"
-        echo "${X25519_OUTPUT:-[empty]}" >&2
+        log_error "Failed to generate valid Xray Reality credentials (raw output redacted for security; status: uuid=$([ -n "$UUID" ] && echo ok || echo empty), privateKey=$([ -n "$PRIVATE_KEY" ] && echo ok || echo empty), publicKey=$([ -n "$PUBLIC_KEY" ] && echo ok || echo empty), shortId=$([ -n "$SHORT_ID" ] && echo ok || echo empty))."
         exit 1
     fi
 fi
@@ -318,6 +460,7 @@ rollback_sysctl() {
             rm -f "$SYSCTL_FILE" || true
         fi
         sysctl --system >/dev/null 2>&1 || true
+        SYSCTL_MODIFIED=false
         log_warn "Rolled back sysctl configuration (${SYSCTL_FILE})."
     fi
 }
@@ -393,36 +536,42 @@ fi
 SERVER_IP="${SERVER_IP_OVERRIDE:-$(curl -s -4 -m 5 https://api.ipify.org || curl -s -4 -m 5 https://ipinfo.io/ip || curl -s -4 -m 5 https://icanhazip.com || echo "YOUR_VPS_IP")}"
 
 # ------------------------------------------------------------------------------
-# 6. Write (0600), Validate, and Atomically Deploy Xray Configuration
+# 6. Build & Validate Candidate Xray Configuration (Least-Privilege Permissions)
 # ------------------------------------------------------------------------------
-log_info "Step 6: Generating and validating Xray server configuration..."
+log_info "Step 6: Generating and validating candidate Xray server configuration..."
 
-mkdir -p "$CONFIG_DIR"
+apply_config_dir_perms "$CONFIG_DIR" "$ACTIVE_XRAY_GROUP"
 TMP_CONFIG="${CONFIG_DIR}/config.tmp.$$.json"
 
+# Pass sensitive values to jq via stdin ONLY (never CLI --arg!)
 if [ "$REUSED_CREDENTIALS" = "true" ] && [ -n "$EXISTING_CLIENTS" ] && [ "$EXISTING_CLIENTS" != "null" ]; then
     CLIENTS_JSON="$EXISTING_CLIENTS"
 else
-    CLIENTS_JSON=$(jq -nc --arg id "$UUID" '[{"id": $id, "flow": "xtls-rprx-vision"}]')
+    CLIENTS_JSON=$(printf '%s' "$UUID" | jq -Rsc '[{"id": ., "flow": "xtls-rprx-vision"}]')
 fi
 
 if [ "$REUSED_CREDENTIALS" = "true" ] && [ -n "$EXISTING_SHORT_IDS" ] && [ "$EXISTING_SHORT_IDS" != "null" ]; then
     SHORT_IDS_JSON="$EXISTING_SHORT_IDS"
 else
-    SHORT_IDS_JSON=$(jq -nc --arg sid "$SHORT_ID" '[$sid]')
+    SHORT_IDS_JSON=$(printf '%s' "$SHORT_ID" | jq -Rsc '[.]')
 fi
 
 EXTRA_INBOUNDS_SNIPPET=""
 if [ -n "$EXTRA_INBOUNDS" ] && [ "$EXTRA_INBOUNDS" != "[]" ] && [ "$EXTRA_INBOUNDS" != "null" ]; then
-    STRIPPED=$(echo "$EXTRA_INBOUNDS" | sed -e 's/^[[:space:]]*\[//' -e 's/\][[:space:]]*$//')
+    STRIPPED=$(printf '%s' "$EXTRA_INBOUNDS" | sed -e 's/^[[:space:]]*\[//' -e 's/\][[:space:]]*$//')
     if [ -n "$STRIPPED" ]; then
         EXTRA_INBOUNDS_SNIPPET=", ${STRIPPED}"
     fi
 fi
 
-# Create TMP_CONFIG strictly with 0600 permissions BEFORE writing privateKey
+# Create TMP_CONFIG strictly restricted BEFORE writing privateKey (never world-readable)
+CONFIG_UMASK="077"
+if [ -n "$ACTIVE_XRAY_GROUP" ]; then
+    CONFIG_UMASK="027"
+fi
+
 (
-    umask 077
+    umask "$CONFIG_UMASK"
     cat > "$TMP_CONFIG" << EOF
 {
   "log": {
@@ -572,7 +721,18 @@ fi
 }
 EOF
 )
-chmod 600 "$TMP_CONFIG"
+apply_config_file_perms "$TMP_CONFIG" "$ACTIVE_XRAY_GROUP"
+
+# Verify non-root xray service account can actually read the candidate config
+if [ "$(id -u)" -eq 0 ] && id xray >/dev/null 2>&1; then
+    if ! su -s /bin/sh xray -c "test -r '$TMP_CONFIG'" 2>/dev/null; then
+        log_error "Non-root service user 'xray' cannot read ${TMP_CONFIG}! Check ${CONFIG_DIR} group ownership."
+        rm -f "$TMP_CONFIG"
+        rollback_sysctl
+        exit 1
+    fi
+    log_info "Verified: non-root user 'xray' can read candidate config."
+fi
 
 # Configuration Pre-flight Validation
 log_info "Testing generated configuration syntax with Xray..."
@@ -585,20 +745,86 @@ if ! "$XRAY_BIN" run -test -config "$TMP_CONFIG" >/dev/null 2>&1 && ! "$XRAY_BIN
 fi
 log_info "Configuration validation passed."
 
-# Backup existing configuration with strict 0600 permissions at creation time
+# ------------------------------------------------------------------------------
+# 7. Strict Firewall Enforcement BEFORE Mutating Active config.json (NO || true!)
+# ------------------------------------------------------------------------------
+rollback_pre_deploy() {
+    rm -f "$TMP_CONFIG"
+    rollback_sysctl
+    if [ "$HAD_PREEXISTING_CONFIG" != "true" ] && [ "$IS_EMPTY_STUB" = "true" ] && [ -f "$EXISTING_CONFIG" ]; then
+        rm -f "$EXISTING_CONFIG" || true
+    fi
+    if [ "$XRAY_INSTALLED_BY_US" = "true" ]; then
+        log_warn "原 config.json 未被覆盖；修复防火墙后请运行: ALLOW_EXISTING=true bash vps_setup.sh"
+    else
+        log_warn "已回滚临时文件与 sysctl，原 config.json 保持原样未修改。"
+    fi
+}
+
+FIREWALL_STATUS="none_detected"
+if command -v ufw >/dev/null 2>&1 && ufw status 2>/dev/null | grep -q "Status: active"; then
+    log_info "Step 7: Active UFW detected; allowing TCP port ${PORT}..."
+    if ! ufw allow "${PORT}/tcp"; then
+        log_error "FAILED to allow port ${PORT}/tcp in UFW! Rolling back before touching active config.json."
+        rollback_pre_deploy
+        exit 1
+    fi
+    FIREWALL_STATUS="ufw_allowed"
+    log_info "Confirmed: UFW allowed TCP port ${PORT}."
+elif command -v firewall-cmd >/dev/null 2>&1 && firewall-cmd --state >/dev/null 2>&1; then
+    log_info "Step 7: Active firewalld detected; allowing TCP port ${PORT}..."
+    if ! firewall-cmd --permanent --add-port="${PORT}/tcp" || ! firewall-cmd --reload; then
+        log_error "FAILED to allow port ${PORT}/tcp in firewalld! Rolling back before touching active config.json."
+        rollback_pre_deploy
+        exit 1
+    fi
+    FIREWALL_STATUS="firewalld_allowed"
+    log_info "Confirmed: firewalld allowed TCP port ${PORT}."
+elif command -v iptables >/dev/null 2>&1; then
+    log_info "Step 7: Ensuring iptables accepts TCP port ${PORT}..."
+    if ! iptables -C INPUT -p tcp --dport "${PORT}" -j ACCEPT 2>/dev/null; then
+        if ! iptables -I INPUT -p tcp --dport "${PORT}" -j ACCEPT; then
+            log_error "FAILED to add iptables ACCEPT rule for TCP port ${PORT}! Rolling back before touching active config.json."
+            rollback_pre_deploy
+            exit 1
+        fi
+    fi
+    FIREWALL_STATUS="iptables_allowed"
+    log_info "Confirmed: iptables allows TCP port ${PORT}."
+fi
+
+# ------------------------------------------------------------------------------
+# 8. Atomic Deployment, Service Restart & Local Listening Verification (with Rollback)
+# ------------------------------------------------------------------------------
 BACKUP_PATH=""
-if [ -f "$EXISTING_CONFIG" ]; then
+if [ "$TREAT_AS_EXISTING" = "true" ] && [ -f "$EXISTING_CONFIG" ]; then
     BACKUP_PATH="${CONFIG_DIR}/config.json.bak.$(date +%s)"
-    install -m 600 "$EXISTING_CONFIG" "$BACKUP_PATH"
+    (
+        umask 077
+        install -m 600 "$EXISTING_CONFIG" "$BACKUP_PATH"
+    )
     log_info "Existing configuration backed up (0600) to ${BACKUP_PATH}"
 fi
 
-# Atomic replacement preserving 0600 permissions
-mv "$TMP_CONFIG" "$EXISTING_CONFIG"
-chmod 600 "$EXISTING_CONFIG"
+rollback_deployed_config() {
+    if [ -n "$BACKUP_PATH" ] && [ -f "$BACKUP_PATH" ]; then
+        log_warn "Initiating automatic rollback to previous configuration: ${BACKUP_PATH}..."
+        cp "$BACKUP_PATH" "$EXISTING_CONFIG"
+        apply_config_file_perms "$EXISTING_CONFIG" "$ACTIVE_XRAY_GROUP"
+        systemctl restart xray || true
+    else
+        rm -f "$EXISTING_CONFIG" || true
+        systemctl stop xray >/dev/null 2>&1 || true
+    fi
+    rollback_sysctl
+    log_warn "修复问题后可使用 ALLOW_EXISTING=true bash vps_setup.sh 重试。"
+}
 
-# Restart Xray with Rollback Protection
-log_info "Restarting Xray service..."
+# Atomic replacement preserving least-privilege permissions (0640 root:xray or 0600)
+mv "$TMP_CONFIG" "$EXISTING_CONFIG"
+apply_config_file_perms "$EXISTING_CONFIG" "$ACTIVE_XRAY_GROUP"
+
+log_info "Step 8: Restarting Xray service..."
 systemctl enable xray >/dev/null 2>&1 || true
 
 RESTART_OK=true
@@ -610,49 +836,10 @@ sleep 2
 if [ "$RESTART_OK" != "true" ] || ! systemctl is-active --quiet xray; then
     log_error "Xray service failed to start/restart after applying new configuration!"
     journalctl -u xray -n 25 --no-pager 2>/dev/null || true
-    if [ -n "$BACKUP_PATH" ] && [ -f "$BACKUP_PATH" ]; then
-        log_warn "Initiating automatic rollback to previous configuration: ${BACKUP_PATH}..."
-        install -m 600 "$BACKUP_PATH" "$EXISTING_CONFIG"
-        systemctl restart xray || true
-    else
-        rm -f "$EXISTING_CONFIG"
-        rollback_sysctl
-    fi
+    rollback_deployed_config
     exit 1
 fi
 log_info "Xray service active!"
-
-# ------------------------------------------------------------------------------
-# 7. Strict Firewall Enforcement & Local Port Binding Verification (NO || true!)
-# ------------------------------------------------------------------------------
-FIREWALL_STATUS="none_detected"
-if command -v ufw >/dev/null 2>&1 && ufw status 2>/dev/null | grep -q "Status: active"; then
-    log_info "Active UFW detected; allowing TCP port ${PORT}..."
-    if ! ufw allow "${PORT}/tcp"; then
-        log_error "FAILED to allow port ${PORT}/tcp in UFW! Aborting instead of reporting false success."
-        exit 1
-    fi
-    FIREWALL_STATUS="ufw_allowed"
-    log_info "Confirmed: UFW allowed TCP port ${PORT}."
-elif command -v firewall-cmd >/dev/null 2>&1 && firewall-cmd --state >/dev/null 2>&1; then
-    log_info "Active firewalld detected; allowing TCP port ${PORT}..."
-    if ! firewall-cmd --permanent --add-port="${PORT}/tcp" || ! firewall-cmd --reload; then
-        log_error "FAILED to allow port ${PORT}/tcp in firewalld!"
-        exit 1
-    fi
-    FIREWALL_STATUS="firewalld_allowed"
-    log_info "Confirmed: firewalld allowed TCP port ${PORT}."
-elif command -v iptables >/dev/null 2>&1; then
-    log_info "Ensuring iptables accepts TCP port ${PORT}..."
-    if ! iptables -C INPUT -p tcp --dport "${PORT}" -j ACCEPT 2>/dev/null; then
-        if ! iptables -I INPUT -p tcp --dport "${PORT}" -j ACCEPT; then
-            log_error "FAILED to add iptables ACCEPT rule for TCP port ${PORT}!"
-            exit 1
-        fi
-    fi
-    FIREWALL_STATUS="iptables_allowed"
-    log_info "Confirmed: iptables allows TCP port ${PORT}."
-fi
 
 if [ "$SKIP_LISTEN_CHECK" != "true" ]; then
     LISTEN_OK=false
@@ -663,36 +850,36 @@ if [ "$SKIP_LISTEN_CHECK" != "true" ]; then
     fi
     if [ "$LISTEN_OK" != "true" ]; then
         log_error "Xray does not appear to be listening on TCP port ${PORT}!"
+        rollback_deployed_config
         exit 1
     fi
     log_info "Confirmed: Xray is actively listening on TCP port ${PORT}."
 fi
 
 # ------------------------------------------------------------------------------
-# 8. Derive Delivered Metadata Strictly From Final Active config.json (0600 File)
+# 9. Derive Delivered Metadata Strictly From Final Active config.json (0600 File)
 # ------------------------------------------------------------------------------
-FINAL_PORT=$(jq -r '.inbounds[0].port' "$EXISTING_CONFIG")
-FINAL_UUID=$(jq -r '.inbounds[0].settings.clients[0].id' "$EXISTING_CONFIG")
-FINAL_FLOW=$(jq -r '.inbounds[0].settings.clients[0].flow // "xtls-rprx-vision"' "$EXISTING_CONFIG")
-FINAL_SNI=$(jq -r '.inbounds[0].streamSettings.realitySettings.serverNames[0]' "$EXISTING_CONFIG")
-FINAL_PRIVATE_KEY=$(jq -r '.inbounds[0].streamSettings.realitySettings.privateKey' "$EXISTING_CONFIG")
-FINAL_SHORT_ID=$(jq -r '.inbounds[0].streamSettings.realitySettings.shortIds[0]' "$EXISTING_CONFIG")
-FINAL_PUBLIC_KEY=$(derive_public_key "$FINAL_PRIVATE_KEY")
+FINAL_PORT=$(jq -r '.inbounds[0].port // empty' "$EXISTING_CONFIG")
+FINAL_UUID=$(jq -r '.inbounds[0].settings.clients[0].id // empty' "$EXISTING_CONFIG")
+FINAL_SNI=$(jq -r '.inbounds[0].streamSettings.realitySettings.serverNames[0] // empty' "$EXISTING_CONFIG")
+FINAL_PRIVATE_KEY=$(jq -r '.inbounds[0].streamSettings.realitySettings.privateKey // empty' "$EXISTING_CONFIG")
+
+FINAL_PUBLIC_KEY=""
+if [ -n "$FINAL_PRIVATE_KEY" ]; then
+    FINAL_PUBLIC_KEY=$(derive_public_key_stdin "$FINAL_PRIVATE_KEY" || true)
+fi
 
 if [ -z "$FINAL_PORT" ] || [ -z "$FINAL_UUID" ] || [ -z "$FINAL_SNI" ] || [ -z "$FINAL_PUBLIC_KEY" ]; then
     log_error "Internal consistency check failed when reading final config ${EXISTING_CONFIG}!"
+    rollback_deployed_config
     exit 1
 fi
 
-METADATA_JSON=$(jq -n \
+# Zero secret exposure in jq argv: read uuid/short_id directly from config.json, pipe public_key on stdin!
+METADATA_JSON=$(printf '%s' "$FINAL_PUBLIC_KEY" | jq -Rs \
+    --slurpfile cfg "$EXISTING_CONFIG" \
     --arg server_ip "$SERVER_IP" \
-    --argjson port "$FINAL_PORT" \
-    --arg uuid "$FINAL_UUID" \
-    --arg flow "$FINAL_FLOW" \
     --arg security "reality" \
-    --arg sni "$FINAL_SNI" \
-    --arg public_key "$FINAL_PUBLIC_KEY" \
-    --arg short_id "$FINAL_SHORT_ID" \
     --arg fingerprint "chrome" \
     --argjson warp_port "$WARP_PORT" \
     --argjson warp_ready "$WARP_READY" \
@@ -700,13 +887,13 @@ METADATA_JSON=$(jq -n \
     --arg firewall_status "$FIREWALL_STATUS" \
     '{
       server_ip: $server_ip,
-      port: $port,
-      uuid: $uuid,
-      flow: $flow,
+      port: $cfg[0].inbounds[0].port,
+      uuid: $cfg[0].inbounds[0].settings.clients[0].id,
+      flow: ($cfg[0].inbounds[0].settings.clients[0].flow // "xtls-rprx-vision"),
       security: $security,
-      sni: $sni,
-      public_key: $public_key,
-      short_id: $short_id,
+      sni: $cfg[0].inbounds[0].streamSettings.realitySettings.serverNames[0],
+      public_key: .,
+      short_id: $cfg[0].inbounds[0].streamSettings.realitySettings.shortIds[0],
       fingerprint: $fingerprint,
       warp_port: $warp_port,
       warp_ready: $warp_ready,
@@ -714,16 +901,17 @@ METADATA_JSON=$(jq -n \
       firewall_status: $firewall_status
     }')
 
-printf '%s\n' "$METADATA_JSON" | write_secret_file_0600 "$OUTPUT_FILE"
+printf '%s\n' "$METADATA_JSON" | write_secret_file_0600 "$OUTPUT_FILE" "$OUTPUT_OWNER"
 
 echo ""
 echo "==================== VPS SETUP COMPLETE ===================="
 echo "Server IP        : ${SERVER_IP}"
 echo "Listening Port   : ${FINAL_PORT}/tcp"
 echo "SNI              : ${FINAL_SNI}"
+echo "Service Group    : ${ACTIVE_XRAY_GROUP:-none (0600)}"
 echo "WARP Dual-Track  : ${WARP_READY} (Google outbound: ${GOOGLE_OUTBOUND})"
 echo "VPS Firewall     : ${FIREWALL_STATUS}"
-echo "Metadata File    : ${OUTPUT_FILE} (permissions: 0600)"
+echo "Metadata File    : ${OUTPUT_FILE} (permissions: 0600${OUTPUT_OWNER:+, owner: ${OUTPUT_OWNER}})"
 echo ""
 echo "[NEXT STEP] Copy ${OUTPUT_FILE} securely to your local machine via scp (do NOT paste secrets into chat),"
 echo "            then verify inbound TCP port reachability + proxy egress from your local machine."
