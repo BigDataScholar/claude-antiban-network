@@ -356,8 +356,9 @@ def main():
     parser.add_argument("--node-json", help="Path to restricted (0600) node metadata JSON from vps_setup.sh (recommended)")
     parser.add_argument("--expected-ip", help="Shorthand for both inbound host and expected egress IP (dedicated VPS)")
     parser.add_argument("--inbound-host", help="Inbound VPS host/IP for direct TCP port check (useful for NAT VPS)")
+    parser.add_argument("--inbound-port", type=int, default=None, help="External client-facing TCP port (useful for NAT VPS)")
     parser.add_argument("--expected-egress-ip", help="Expected outbound egress IPv4 address (useful for NAT VPS)")
-    parser.add_argument("--expected-port", type=int, help="Expected VPS TCP inbound port for direct reachability check")
+    parser.add_argument("--expected-port", type=int, default=None, help="Expected VPS TCP inbound port for direct reachability check")
     parser.add_argument("--allow-any-us", action="store_true", help="Allow any US egress IP without verifying exact VPS match")
     parser.add_argument("--proxy-only", action="store_true", help="Skip hard requirement for TUN Fake-IP takeover (system-proxy-only mode)")
     parser.add_argument("--strict-web", action="store_true", help="Fail gate if claude.ai returns Cloudflare Turnstile Challenge (CF_CHALLENGE)")
@@ -372,9 +373,18 @@ def main():
         with open(node_path, "r", encoding="utf-8") as f:
             node_meta = json.load(f)
 
-    inbound_host = args.inbound_host or args.expected_ip or node_meta.get("server_ip")
+    inbound_host = args.inbound_host or args.expected_ip or node_meta.get("inbound_host") or node_meta.get("server_ip")
     expected_egress_ip = args.expected_egress_ip or args.expected_ip or node_meta.get("egress_ip") or node_meta.get("server_ip")
-    expected_port = args.expected_port or node_meta.get("port")
+    if args.inbound_port is not None:
+        expected_port = args.inbound_port
+    elif args.expected_port is not None:
+        expected_port = args.expected_port
+    elif node_meta.get("inbound_port") is not None:
+        expected_port = node_meta["inbound_port"]
+    elif node_meta.get("port") is not None:
+        expected_port = node_meta["port"]
+    else:
+        expected_port = node_meta.get("listen_port")
 
     print_header("Claude & AI Anti-Ban Network Environment Gate Check")
     print(f"代理入口 : {args.proxy} (强制走代理，已免疫 NO_PROXY/no_proxy)")

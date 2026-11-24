@@ -117,6 +117,74 @@ class TestGenerateClashConfig(unittest.TestCase):
             self.assertTrue(vless_text.startswith(f"vless://{secret_uuid}@198.51.100.42:24433?"))
             self.assertIn("sid=", vless_text)
 
+    def test_nat_metadata_and_cli_overrides_precedence(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            node_file = Path(tmp) / "nat-node.json"
+            yaml_nat = Path(tmp) / "nat.yaml"
+            yaml_override = Path(tmp) / "override.yaml"
+
+            node_data = {
+                "server_ip": "nat.example.com",
+                "port": 34433,
+                "inbound_host": "nat.example.com",
+                "inbound_port": 34433,
+                "listen_port": 24433,
+                "egress_ip": "203.0.113.88",
+                "uuid": "11111111-2222-3333-4444-555555555555",
+                "flow": "xtls-rprx-vision",
+                "security": "reality",
+                "sni": "gateway.icloud.com",
+                "public_key": ALICE_PUB,
+                "short_id": "aabbccdd",
+                "fingerprint": "chrome",
+            }
+            node_file.write_text(json.dumps(node_data), encoding="utf-8")
+            os.chmod(node_file, 0o600)
+
+            # 1. Default reads NAT inbound_host & inbound_port (NOT listen_port or egress_ip)
+            subprocess.run(
+                [
+                    sys.executable,
+                    str(SCRIPTS_DIR / "generate_clash_config.py"),
+                    "--json-file",
+                    str(node_file),
+                    "--output",
+                    str(yaml_nat),
+                ],
+                capture_output=True,
+                text=True,
+                check=True,
+            )
+            nat_text = yaml_nat.read_text(encoding="utf-8")
+            self.assertIn('server: "nat.example.com"', nat_text)
+            self.assertIn("port: 34433", nat_text)
+            nat_vless = (Path(tmp) / "nat-mobile-vless.txt").read_text(encoding="utf-8").strip()
+            self.assertIn("@nat.example.com:34433?", nat_vless)
+
+            # 2. Explicit CLI --ip and --port MUST override JSON metadata
+            subprocess.run(
+                [
+                    sys.executable,
+                    str(SCRIPTS_DIR / "generate_clash_config.py"),
+                    "--json-file",
+                    str(node_file),
+                    "--ip",
+                    "198.51.100.77",
+                    "--port",
+                    "45555",
+                    "--output",
+                    str(yaml_override),
+                ],
+                capture_output=True,
+                text=True,
+                check=True,
+            )
+            ovr_text = yaml_override.read_text(encoding="utf-8")
+            self.assertIn('server: "198.51.100.77"', ovr_text)
+            self.assertIn("port: 45555", ovr_text)
+            ovr_vless = (Path(tmp) / "override-mobile-vless.txt").read_text(encoding="utf-8").strip()
+            self.assertIn("@198.51.100.77:45555?", ovr_vless)
+
 
 class TestVerifyEnvironment(unittest.TestCase):
     def test_forced_proxy_handler_ignores_no_proxy_env(self):
@@ -236,6 +304,40 @@ class TestVerifyEnvironment(unittest.TestCase):
         self.assertIn("NAT 独立出口", out)
         self.assertIn("[GATE: PASS]", out)
 
+    def test_nat_vps_node_json_reads_distinct_inbound_and_egress(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            node_file = Path(tmp) / "nat-node.json"
+            node_file.write_text(
+                json.dumps(
+                    {
+                        "inbound_host": "198.51.100.10",
+                        "inbound_port": 34433,
+                        "listen_port": 24433,
+                        "egress_ip": "203.0.113.88",
+                        "server_ip": "198.51.100.10",
+                        "port": 34433,
+                    }
+                ),
+                encoding="utf-8",
+            )
+            ipinfo_ok = {
+                "ip": "203.0.113.88",
+                "country": "US",
+                "city": "San Jose",
+                "region": "California",
+                "org": "AS2914 NTT",
+            }
+            code, out, _, port_calls = self._run_verify_with_mocks(
+                ["--node-json", str(node_file)],
+                ipinfo_resp=ipinfo_ok,
+                web_behavior="direct",
+                port_ok=True,
+            )
+            self.assertEqual(code, 0)
+            self.assertEqual(port_calls, [("198.51.100.10", 34433)])
+            self.assertIn("NAT 独立出口", out)
+            self.assertIn("[GATE: PASS]", out)
+
     def test_rejects_unrelated_us_exit_ip(self):
         code, out, _, _ = self._run_verify_with_mocks(
             ["--expected-ip", "203.0.113.10"],
@@ -327,6 +429,8 @@ fi
         xray_group="none",
         broken_x25519=False,
         spy_argv=False,
+        systemctl_restart_fail=False,
+        enable_mock_sysctl=False,
     ):
         tmp_path = Path(tmp)
         bin_dir = tmp_path / "bin"
@@ -335,6 +439,9 @@ fi
         cfg_dir.mkdir()
 
         argv_log = tmp_path / "child_argv.log" if spy_argv else None
+        ufw_log = tmp_path / "ufw.log"
+        systemctl_log = tmp_path / "systemctl.log"
+        sysctl_state = tmp_path / "sysctl.state"
         mock_xray = bin_dir / "xray"
         xray_content = self._mock_xray_script(broken_x25519=broken_x25519, argv_log=argv_log)
 
@@ -385,16 +492,73 @@ exec "{real_jq}" "$@"
             )
             spy_jq.chmod(0o755)
 
+        # Optional mock sysctl tracking live kernel runtime values
+        if enable_mock_sysctl:
+            sysctl_state.write_text(
+                "\n".join(
+                    [
+                        "net.ipv6.conf.all.disable_ipv6=0",
+                        "net.ipv6.conf.default.disable_ipv6=0",
+                        "net.ipv6.conf.lo.disable_ipv6=0",
+                        "net.ipv4.tcp_keepalive_time=7200",
+                        "net.ipv4.tcp_keepalive_intvl=75",
+                        "net.ipv4.tcp_keepalive_probes=9",
+                        "net.core.default_qdisc=pfifo_fast",
+                        "net.ipv4.tcp_congestion_control=cubic",
+                    ]
+                )
+                + "\n",
+                encoding="utf-8",
+            )
+            mock_sysctl = bin_dir / "sysctl"
+            mock_sysctl.write_text(
+                f"""#!/usr/bin/env bash
+STATE="{sysctl_state}"
+if [ "$1" = "-n" ]; then
+    grep "^$2=" "$STATE" | head -n 1 | cut -d'=' -f2-
+    exit 0
+elif [ "$1" = "-w" ]; then
+    key="${{2%%=*}}"
+    val="${{2#*=}}"
+    grep -v "^${{key}}=" "$STATE" > "${{STATE}}.tmp" || true
+    printf "%s=%s\\n" "$key" "$val" >> "${{STATE}}.tmp"
+    mv "${{STATE}}.tmp" "$STATE"
+    exit 0
+elif [ "$1" = "--system" ]; then
+    if [ -f "${{SYSCTL_FILE:-/nonexistent}}" ]; then
+        while IFS= read -r line; do
+            case "$line" in
+                ""|\\#*) continue ;;
+            esac
+            k=$(printf "%s" "$line" | cut -d'=' -f1 | tr -d ' ')
+            v=$(printf "%s" "$line" | cut -d'=' -f2- | tr -d ' ')
+            grep -v "^${{k}}=" "$STATE" > "${{STATE}}.tmp" || true
+            printf "%s=%s\\n" "$k" "$v" >> "${{STATE}}.tmp"
+            mv "${{STATE}}.tmp" "$STATE"
+        done < "${{SYSCTL_FILE}}"
+    fi
+    exit 0
+fi
+exit 0
+""",
+                encoding="utf-8",
+            )
+            mock_sysctl.chmod(0o755)
+
         # Mock systemctl
         mock_systemctl = bin_dir / "systemctl"
         mock_systemctl.write_text(
-            """#!/usr/bin/env bash
+            f"""#!/usr/bin/env bash
+printf "%s\\n" "$*" >> "{systemctl_log}"
+if [ "$1" = "restart" ] && [ "$2" = "xray" ]; then
+    exit {1 if systemctl_restart_fail else 0}
+fi
 if [ "$1" = "is-active" ] || [ "$1" = "is-enabled" ]; then
-    if [ -f "${MOCK_XRAY_RUNNING:-/nonexistent}" ] && [ "$3" = "xray" ]; then
+    if [ -f "${{MOCK_XRAY_RUNNING:-/nonexistent}}" ] && [ "$3" = "xray" ]; then
         exit 0
     fi
-    if [ "$1" = "is-active" ] && [ "$3" = "xray" ] && [ -f "${CONFIG_DIR}/config.json" ]; then
-        exit 0
+    if [ "$1" = "is-active" ] && [ "$3" = "xray" ] && [ -f "${{CONFIG_DIR}}/config.json" ]; then
+        exit {1 if systemctl_restart_fail else 0}
     fi
     exit 1
 fi
@@ -411,6 +575,7 @@ exit 0
         mock_ufw = bin_dir / "ufw"
         mock_ufw.write_text(
             f"""#!/usr/bin/env bash
+printf "%s\\n" "$*" >> "{ufw_log}"
 if [ "$1" = "status" ]; then
     echo "Status: active"
     exit 0
@@ -432,7 +597,7 @@ exit 0
         env["SKIP_ROOT_CHECK"] = "true"
         env["SKIP_APT"] = "true"
         env["SKIP_XRAY_INSTALL"] = "false" if use_upstream_installer else "true"
-        env["SKIP_SYSCTL"] = "true"
+        env["SKIP_SYSCTL"] = "false" if enable_mock_sysctl else "true"
         env["SKIP_WARP"] = "true"
         env["SKIP_LISTEN_CHECK"] = "true"
         env["XRAY_BIN"] = str(mock_xray)
@@ -705,6 +870,94 @@ exit 0
             self.assertEqual(meta["public_key"], ALICE_PUB)
             self.assertEqual(new_cfg["inbounds"][0]["streamSettings"]["realitySettings"]["shortIds"], [meta["short_id"]])
             self.assertTrue(len(meta["short_id"]) > 0)
+
+    def test_xray_start_failure_rolls_back_config_firewall_and_live_sysctl(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            tmp_path, cfg_dir, env, _, _ = self._create_sandbox(
+                tmp, systemctl_restart_fail=True, enable_mock_sysctl=True
+            )
+            res = subprocess.run(
+                ["bash", str(SCRIPTS_DIR / "vps_setup.sh")],
+                env=env,
+                capture_output=True,
+                text=True,
+            )
+            self.assertNotEqual(res.returncode, 0)
+            self.assertFalse((cfg_dir / "config.json").exists())
+            self.assertFalse((tmp_path / "node.json").exists())
+            self.assertFalse((tmp_path / "99-antiban.conf").exists())
+
+            # Newly added UFW rule must be deleted on rollback
+            ufw_log = (tmp_path / "ufw.log").read_text(encoding="utf-8")
+            self.assertIn("allow 24433/tcp", ufw_log)
+            self.assertIn("--force delete allow 24433/tcp", ufw_log)
+
+            # Live kernel runtime values must be restored (not stuck at modified values)
+            sysctl_state = (tmp_path / "sysctl.state").read_text(encoding="utf-8")
+            self.assertIn("net.ipv6.conf.all.disable_ipv6=0", sysctl_state)
+            self.assertIn("net.ipv4.tcp_keepalive_time=7200", sysctl_state)
+            self.assertIn("net.ipv4.tcp_congestion_control=cubic", sysctl_state)
+
+    def test_node_json_write_failure_rolls_back_config_firewall_and_sysctl(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            tmp_path, cfg_dir, env, _, _ = self._create_sandbox(tmp, enable_mock_sysctl=True)
+            # Make parent of OUTPUT_FILE a regular file so write_secret_file_0600 always fails
+            blocker = tmp_path / "not_a_dir"
+            blocker.write_text("blocker", encoding="utf-8")
+            env["OUTPUT_FILE"] = str(blocker / "node.json")
+
+            res = subprocess.run(
+                ["bash", str(SCRIPTS_DIR / "vps_setup.sh")],
+                env=env,
+                capture_output=True,
+                text=True,
+            )
+            self.assertNotEqual(res.returncode, 0)
+            self.assertNotIn("VPS SETUP COMPLETE", res.stdout)
+            self.assertFalse((cfg_dir / "config.json").exists())
+            self.assertFalse((tmp_path / "99-antiban.conf").exists())
+
+            systemctl_log = (tmp_path / "systemctl.log").read_text(encoding="utf-8")
+            self.assertIn("stop xray", systemctl_log)
+
+            ufw_log = (tmp_path / "ufw.log").read_text(encoding="utf-8")
+            self.assertIn("--force delete allow 24433/tcp", ufw_log)
+
+            sysctl_state = (tmp_path / "sysctl.state").read_text(encoding="utf-8")
+            self.assertIn("net.ipv6.conf.all.disable_ipv6=0", sysctl_state)
+            self.assertIn("net.ipv4.tcp_keepalive_time=7200", sysctl_state)
+
+    def test_nat_vps_emits_distinct_listen_inbound_and_egress_fields(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            tmp_path, cfg_dir, env, _, _ = self._create_sandbox(tmp)
+            env["PORT"] = "24433"
+            env["INBOUND_HOST"] = "nat.example.com"
+            env["INBOUND_PORT"] = "34433"
+            env["EGRESS_IP"] = "203.0.113.88"
+
+            subprocess.run(
+                ["bash", str(SCRIPTS_DIR / "vps_setup.sh")],
+                env=env,
+                capture_output=True,
+                text=True,
+                check=True,
+            )
+
+            cfg = json.loads((cfg_dir / "config.json").read_text(encoding="utf-8"))
+            meta = json.loads((tmp_path / "node.json").read_text(encoding="utf-8"))
+            ufw_log = (tmp_path / "ufw.log").read_text(encoding="utf-8")
+
+            # Server listens and opens firewall on local listen_port (24433)
+            self.assertEqual(cfg["inbounds"][0]["port"], 24433)
+            self.assertIn("allow 24433/tcp", ufw_log)
+
+            # Node metadata records all three distinct endpoints cleanly
+            self.assertEqual(meta["listen_port"], 24433)
+            self.assertEqual(meta["inbound_host"], "nat.example.com")
+            self.assertEqual(meta["inbound_port"], 34433)
+            self.assertEqual(meta["egress_ip"], "203.0.113.88")
+            self.assertEqual(meta["server_ip"], "nat.example.com")
+            self.assertEqual(meta["port"], 34433)
 
 
 if __name__ == "__main__":

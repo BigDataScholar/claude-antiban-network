@@ -209,12 +209,14 @@ def main():
         "--json-input",
         help="Legacy alias: path to JSON file (passing raw JSON strings on CLI is discouraged)",
     )
-    parser.add_argument("--ip", help="VPS Server IPv4")
-    parser.add_argument("--port", type=int, default=24433, help="Port (default: 24433)")
-    parser.add_argument("--uuid", help="Client UUID")
-    parser.add_argument("--public-key", help="Reality Public Key")
-    parser.add_argument("--short-id", default=None, help="Reality Short ID (empty string '' is valid)")
-    parser.add_argument("--sni", default="gateway.icloud.com", help="Server SNI (default: gateway.icloud.com)")
+    parser.add_argument("--ip", help="Client-facing VPS host/IP (overrides JSON metadata)")
+    parser.add_argument("--inbound-host", help="Alias for --ip: external client-facing host/IP (for NAT VPS)")
+    parser.add_argument("--port", type=int, default=None, help="Client-facing TCP port (overrides JSON metadata; fallback: 24433)")
+    parser.add_argument("--inbound-port", type=int, default=None, help="Alias for --port: external client-facing TCP port (for NAT VPS)")
+    parser.add_argument("--uuid", help="Client UUID (overrides JSON metadata)")
+    parser.add_argument("--public-key", help="Reality Public Key (overrides JSON metadata)")
+    parser.add_argument("--short-id", default=None, help="Reality Short ID (overrides JSON metadata; empty string '' is valid)")
+    parser.add_argument("--sni", default=None, help="Server SNI (overrides JSON metadata; fallback: gateway.icloud.com)")
     parser.add_argument("--name", default="🇺🇸 独享-Claude-原生住宅9929", help="Node display name")
     parser.add_argument("--output", default="Claude-AntiBan-Profile.yaml", help="Output Clash YAML path")
     parser.add_argument(
@@ -247,20 +249,35 @@ def main():
             )
             data = json.loads(json_source)
 
-    server_ip = data.get("server_ip") or args.ip
-    port = data.get("port") if data.get("port") is not None else args.port
-    uuid = data.get("uuid") or args.uuid
-    public_key = data.get("public_key") or args.public_key
-    sni = data.get("sni") or args.sni
+    # Explicit CLI overrides ALWAYS take precedence over JSON metadata;
+    # prefer client-facing inbound_host / inbound_port for NAT VPS deployments.
+    server_ip = args.inbound_host or args.ip or data.get("inbound_host") or data.get("server_ip")
+
+    if args.inbound_port is not None:
+        port = args.inbound_port
+    elif args.port is not None:
+        port = args.port
+    elif data.get("inbound_port") is not None:
+        port = data["inbound_port"]
+    elif data.get("port") is not None:
+        port = data["port"]
+    elif data.get("listen_port") is not None:
+        port = data["listen_port"]
+    else:
+        port = 24433
+
+    uuid = args.uuid or data.get("uuid")
+    public_key = args.public_key or data.get("public_key")
+    sni = args.sni or data.get("sni") or "gateway.icloud.com"
     flow = data.get("flow") or "xtls-rprx-vision"
     fingerprint = data.get("fingerprint") or "chrome"
     node_name = args.name
 
-    # Explicitly preserve valid empty string short_id == ""
-    if "short_id" in data and data["short_id"] is not None:
-        short_id = str(data["short_id"])
-    elif args.short_id is not None:
+    # Explicitly preserve valid empty string short_id == "" (CLI overrides JSON)
+    if args.short_id is not None:
         short_id = str(args.short_id)
+    elif "short_id" in data and data["short_id"] is not None:
+        short_id = str(data["short_id"])
     else:
         short_id = None
 

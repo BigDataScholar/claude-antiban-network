@@ -27,8 +27,8 @@ description: >-
    * 保留上游非 root `User=xray` systemd 服务账号（`/usr/local/etc/xray` 为 `0750 root:xray`，`config.json` 为 `0640 root:xray`，备份与节点元数据严格 `0600`）；
    * 服务端全程通过标准输入（`openssl pkey` / `jq` stdin）处理密钥与凭证，不将私钥或 UUID 传入子进程命令行参数。
 4. **必须从客户端实测入站端口与 HTTPS 精确出口 IP**：
-   * 服务端脚本在覆盖 `config.json` 与重启 Xray **之前**校验 UFW / firewalld / iptables，失败会回滚临时配置与 `sysctl` 并中止（绝不假报成功）；但**云厂商控制台安全组独立于 VPS 防火墙**；
-   * 验收时必须传入 `--node-json ~/.claude-antiban/node.json`，从本机直连验证入站 TCP 端口可达，并通过 **HTTPS**（非明文 HTTP）精确比对代理出口 IP 等于本次部署的 VPS 出口 IP（NAT VPS 入口/出口不同时使用 `--inbound-host` + `--expected-egress-ip`）。
+   * 服务端脚本在覆盖 `config.json` 与重启 Xray **之前**校验 UFW / firewalld / iptables；且若 Xray 启动、本地监听检查或 `node.json` 交付任一环节失败，均会完整回滚 `config.json`、本次新增的防火墙规则以及 `sysctl` 文件与内核实时值（绝不留半套状态）；
+   * **云厂商控制台安全组独立于 VPS 防火墙**，验收时必须传入 `--node-json ~/.claude-antiban/node.json`，从本机直连验证入站 TCP 端口可达，并通过 **HTTPS**（非明文 HTTP）精确比对代理出口 IP 等于本次部署的 VPS 出口 IP。
 
 ```mermaid
 flowchart TD
@@ -74,40 +74,51 @@ flowchart TD
 
 ---
 
-### 第 2 步：远程部署 VPS 并通过 `0600` 文件回收节点元数据
+### 第 2 步：通过私有 `0700` 暂存目录远程部署 VPS 并回收 `0600` 元数据
 
-根据 `<SSH_USER>` 选择对应分支：
+**严禁从共享 `/tmp` 的固定路径提权执行脚本或存放节点文件**；每次部署均在用户主目录下创建独立的 `0700` 暂存目录，确认本次上传成功后再执行，拉取后立即清理：
 
 #### 模式 A：直接以 `root` 登录的 VPS
 ```bash
-# 1. 上传并执行服务端部署脚本（默认仅允许全新 VPS；不向终端吐出敏感凭证）
-scp -P <SSH_PORT> <skill-path>/scripts/vps_setup.sh root@<VPS_IP>:/tmp/vps_setup.sh
-ssh -p <SSH_PORT> root@<VPS_IP> "bash /tmp/vps_setup.sh && rm -f /tmp/vps_setup.sh"
+# 1. 创建仅当前用户可访问的私有 0700 暂存目录
+REMOTE_STAGE=$(ssh -p <SSH_PORT> root@<VPS_IP> 'umask 077 && mktemp -d "$HOME/.claude-antiban-stage.XXXXXX"')
 
-# 2. 创建本机受限目录 (0700)，通过 scp 拉取 0600 节点元数据文件
+# 2. 上传脚本并确认上传成功后再执行（默认仅允许全新 VPS；不向终端吐出敏感凭证）
+scp -P <SSH_PORT> <skill-path>/scripts/vps_setup.sh "root@<VPS_IP>:${REMOTE_STAGE}/vps_setup.sh" && \
+ssh -p <SSH_PORT> root@<VPS_IP> \
+  "test -s '${REMOTE_STAGE}/vps_setup.sh' && OUTPUT_FILE='${REMOTE_STAGE}/node.json' bash '${REMOTE_STAGE}/vps_setup.sh'"
+
+# 3. 拉取 0600 节点元数据到本地受限目录，并立即清理远端暂存目录
 mkdir -p -m 700 ~/.claude-antiban
-scp -P <SSH_PORT> root@<VPS_IP>:/root/claude-antiban-node.json ~/.claude-antiban/node.json
-chmod 600 ~/.claude-antiban/node.json
+scp -P <SSH_PORT> "root@<VPS_IP>:${REMOTE_STAGE}/node.json" ~/.claude-antiban/node.json && \
+chmod 600 ~/.claude-antiban/node.json && \
+ssh -p <SSH_PORT> root@<VPS_IP> "rm -f '${REMOTE_STAGE}/vps_setup.sh' '${REMOTE_STAGE}/node.json' && rmdir '${REMOTE_STAGE}'"
 ```
 
 #### 模式 B：普通用户 + `sudo` 登录的 VPS（如 AWS / GCP / Azure 的 `ubuntu` / `debian`）
 ```bash
-# 1. 上传脚本并以 sudo 执行，通过 OUTPUT_FILE + OUTPUT_OWNER 生成仅当前 SSH 用户可读的 0600 文件
-scp -P <SSH_PORT> <skill-path>/scripts/vps_setup.sh <SSH_USER>@<VPS_IP>:/tmp/vps_setup.sh
-ssh -p <SSH_PORT> <SSH_USER>@<VPS_IP> \
-  "sudo OUTPUT_FILE=/tmp/claude-antiban-node.json OUTPUT_OWNER=\$USER bash /tmp/vps_setup.sh && rm -f /tmp/vps_setup.sh"
-# 注：若远端 sudo 需要输入密码，请改为引导用户在自己本机终端加 `ssh -t` 执行，勿在聊天收集密码
+# 1. 在当前 SSH 用户主目录下创建私有 0700 暂存目录（杜绝共享 /tmp 竞态风险）
+REMOTE_STAGE=$(ssh -p <SSH_PORT> <SSH_USER>@<VPS_IP> 'umask 077 && mktemp -d "$HOME/.claude-antiban-stage.XXXXXX"')
 
-# 2. 通过 scp 拉取 0600 元数据文件，并立即删除远端 /tmp 临时凭证文件
+# 2. 上传脚本并确认本次上传成功后再以 sudo 执行，节点元数据写入同一私有 0700 目录
+scp -P <SSH_PORT> <skill-path>/scripts/vps_setup.sh "<SSH_USER>@<VPS_IP>:${REMOTE_STAGE}/vps_setup.sh" && \
+ssh -p <SSH_PORT> <SSH_USER>@<VPS_IP> \
+  "test -s '${REMOTE_STAGE}/vps_setup.sh' && chmod 700 '${REMOTE_STAGE}/vps_setup.sh' && sudo OUTPUT_FILE='${REMOTE_STAGE}/node.json' OUTPUT_OWNER=\"\$USER\" bash '${REMOTE_STAGE}/vps_setup.sh'"
+# 注：若远端 sudo 需要输入密码，请引导用户在自己本机终端加 `ssh -t` 执行，勿在聊天收集密码
+
+# 3. 通过 scp 拉取 0600 元数据文件，并立即清理远端暂存目录
 mkdir -p -m 700 ~/.claude-antiban
-scp -P <SSH_PORT> <SSH_USER>@<VPS_IP>:/tmp/claude-antiban-node.json ~/.claude-antiban/node.json
-chmod 600 ~/.claude-antiban/node.json
-ssh -p <SSH_PORT> <SSH_USER>@<VPS_IP> "rm -f /tmp/claude-antiban-node.json"
+scp -P <SSH_PORT> "<SSH_USER>@<VPS_IP>:${REMOTE_STAGE}/node.json" ~/.claude-antiban/node.json && \
+chmod 600 ~/.claude-antiban/node.json && \
+ssh -p <SSH_PORT> <SSH_USER>@<VPS_IP> "rm -f '${REMOTE_STAGE}/vps_setup.sh' '${REMOTE_STAGE}/node.json' && rmdir '${REMOTE_STAGE}'"
 ```
 
+* **NAT VPS（对外入口地址/端口与本机监听端口或出口 IP 不同）**：
+  * 执行 `vps_setup.sh` 时显式传入 `PORT=<本机监听端口> INBOUND_HOST=<对外入口地址> INBOUND_PORT=<对外映射端口>`（如出口 IP 需指定可同时传 `EGRESS_IP=<出口IP>`）；
+  * `node.json` 会分别记录 `listen_port`、`inbound_host`、`inbound_port` 与 `egress_ip`，后续配置生成与门禁验收会自动各取所需（命令行 `--ip` / `--port` / `--inbound-host` / `--inbound-port` / `--expected-egress-ip` 优先级始终高于 JSON）。
 * **退出码处理**：
   * 若 `vps_setup.sh` 退出码为 `2`：说明目标 VPS 已有旧 Xray/WARP，向用户汇报并确认是否要显式启用 `ALLOW_EXISTING=true`（或换一台全新 VPS）。
-  * 若防火墙或启动步骤报错退出：脚本已自动回滚临时配置与 `sysctl`（不覆盖原 `config.json`）；请直接告知用户具体失败项，修复后可带 `ALLOW_EXISTING=true` 重试，切勿假装部署成功。
+  * 若防火墙、服务启动或 `node.json` 写入报错退出：脚本已自动回滚配置、本次新增的防火墙规则以及 `sysctl` 文件与内核实时值；请直接告知用户具体失败项，修复后可带 `ALLOW_EXISTING=true` 重试，切勿假装部署成功。
 
 ---
 
@@ -145,16 +156,17 @@ python3 <skill-path>/scripts/generate_clash_config.py \
 待用户启动 Clash Verge 后，**必须传入 `--node-json ~/.claude-antiban/node.json`** 运行门禁验收：
 
 ```bash
-# 标准独享公网 IP VPS：
+# 标准独享公网 IP VPS（以及已通过 INBOUND_HOST/INBOUND_PORT 部署的 NAT VPS）：
 python3 <skill-path>/scripts/verify_environment.py \
   --proxy http://127.0.0.1:7897 \
   --node-json ~/.claude-antiban/node.json
 
-# 若为 NAT VPS（入站地址与出站公网 IP 不同）：
+# 如需临时覆盖 NAT VPS 的入站地址/端口或预期出口 IP：
 python3 <skill-path>/scripts/verify_environment.py \
   --proxy http://127.0.0.1:7897 \
   --node-json ~/.claude-antiban/node.json \
   --inbound-host <NAT_INBOUND_HOST> \
+  --inbound-port <NAT_INBOUND_PORT> \
   --expected-egress-ip <NAT_EGRESS_IP>
 ```
 

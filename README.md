@@ -9,8 +9,8 @@
 
 经过长期实战打磨与多轮独立安全审计（涵盖全新首次部署、上游安装器兼容、非 root 服务账号、失败回滚与客户端真实验收），本项目具备以下特性：
 
-* **全新 VPS 优先与失败回滚**：默认仅支持全新 Debian 11+ / Ubuntu 22.04+ VPS；若检测到已有 Xray 或 WARP，在修改任何系统文件前即刻中止退出；防火墙校验提前到覆盖 `config.json` 与重启 Xray **之前**，任何失败均自动回滚临时配置与 `sysctl`，并支持 `ALLOW_EXISTING=true` 干净重试；
-* **零凭证进聊天 / 命令参数**：优先使用本机 SSH 密钥 / `ssh-agent`（同时支持 `root` 与非 root `sudo` VPS，绝不索要明文密码），服务端全程通过 stdin 处理私钥与 UUID（不进入子进程命令行参数），节点元数据与手机链接全程通过 `0600` 受限文件交接；
+* **全新 VPS 优先与事务级失败回滚**：默认仅支持全新 Debian 11+ / Ubuntu 22.04+ VPS；若检测到已有 Xray 或 WARP，在修改任何系统文件前即刻中止退出；若防火墙、Xray 启动、端口监听或 `node.json` 写入任一环节失败，均自动回滚配置、本次新增的防火墙规则及 `sysctl` 文件与内核实时值，并支持 `ALLOW_EXISTING=true` 干净重试；
+* **零凭证进聊天 / 命令参数**：优先使用本机 SSH 密钥 / `ssh-agent`（支持 `root` 与普通 `sudo` 用户，通过私有 `0700` 暂存目录部署，不使用共享 `/tmp` 固定路径，绝不索要明文密码），服务端全程通过 stdin 处理私钥与 UUID，节点元数据与手机链接全程通过 `0600` 受限文件交接；
 * **固定供应链版本与最小权限运行**：固定经验证的官方 `XTLS/Xray-install` 提交哈希与 SHA256 校验和及 Xray-core 发行版（`v26.11.9`），保留上游非 root `User=xray` 服务账号（`/usr/local/etc/xray` `0750 root:xray`、`config.json` `0640 root:xray`，备份与元数据严格 `0600`）；
 * **双轨隔离与防断流**：Claude / ChatGPT 强制走独享美区原生 IP；Google / Gemini 自动分流走 Cloudflare WARP 解锁 `ZZ` 区域限制；内核级 TCP Keepalive（30s）+ Xray Keepalive（15s）缓解深度思考 `Broken Pipe` 断流；
 * **零泄露且不卡顿的本地配置**：实战验证的 `Fake-IP + geolocation-!cn + GEOIP,CN,DIRECT,no-resolve + UDP 443 阻断` 架构，彻底消除海外域名国内 DNS 泄露与 X / YouTube 卡顿；

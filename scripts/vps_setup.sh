@@ -14,10 +14,10 @@
 # 5. Zero secret exposure in child-process CLI args or error stderr:
 #    - Derives X25519 PublicKey via stdin-only openssl pkey (RFC 7748).
 #    - Passes sensitive fields to jq via stdin / config file, never CLI --arg.
-# 6. Firewall enforcement BEFORE overwriting config.json or restarting Xray,
-#    with full rollback (config + sysctl + service) and clear retry path.
-# 7. Zero split-brain credentials: supports valid empty Reality shortId ("") and
-#    derives delivered metadata strictly from the final active config.json.
+# 6. Full transactional rollback across config.json, newly added firewall rules,
+#    live + persistent sysctl kernel values, and node.json delivery failure.
+# 7. First-class NAT VPS metadata: records listen_port, inbound_host, inbound_port,
+#    and egress_ip separately (plus backwards-compatible server_ip & port aliases).
 # ==============================================================================
 
 set -euo pipefail
@@ -36,7 +36,10 @@ for arg in "$@"; do
 Usage: bash vps_setup.sh [--print-json]
 
 Environment variables:
-  PORT                 Listening TCP port for VLESS Reality (default: 24433)
+  PORT                 Local VPS listening TCP port for VLESS Reality (default: 24433)
+  INBOUND_HOST         External client-facing host/IP for NAT VPS (default: detected egress IP)
+  INBOUND_PORT         External client-facing TCP port for NAT VPS (default: PORT)
+  EGRESS_IP            Expected outbound public IPv4 (default: auto-detected)
   SNI                  Reality camouflage SNI (default: gateway.icloud.com)
   ALLOW_EXISTING=true  Permit running on a VPS that already has Xray/WARP
   REGENERATE=true      Rotate UUID, Reality keys, and shortId (requires ALLOW_EXISTING=true if existing)
@@ -58,6 +61,9 @@ done
 # Configuration & Pinned Supply Chain Constants
 # ------------------------------------------------------------------------------
 PORT_INPUT="${PORT:-}"
+INBOUND_HOST_INPUT="${INBOUND_HOST:-}"
+INBOUND_PORT_INPUT="${INBOUND_PORT:-}"
+EGRESS_IP_INPUT="${EGRESS_IP:-${SERVER_IP_OVERRIDE:-}}"
 SNI_INPUT="${SNI:-}"
 WARP_PORT="${WARP_PORT:-40000}"
 ALLOW_EXISTING="${ALLOW_EXISTING:-false}"
@@ -110,7 +116,7 @@ derive_public_key_stdin() {
     esac
 
     local byte_len
-    byte_len=$(printf '%s' "$b64" | openssl base64 -d -A 2>/dev/null | wc -c | tr -d ' ')
+    byte_len=$(printf '%s' "$b64" | openssl base64 -d -A 2>/dev/null | wc -c | tr -d ' ' || true)
     if [ "${byte_len:-0}" -ne 32 ]; then
         return 1
     fi
@@ -124,7 +130,7 @@ derive_public_key_stdin() {
       | tail -c 32 \
       | openssl base64 -A 2>/dev/null \
       | tr '+/' '-_' \
-      | tr -d '=\r\n')
+      | tr -d '=\r\n' || true)
 
     if [ -z "$derived" ]; then
         return 1
@@ -194,23 +200,36 @@ apply_config_file_perms() {
 }
 
 # Helper: atomic write with strict 0600 permissions before content is written
+# (Explicit error checks so callers using `if ! ...` always receive accurate rc)
 write_secret_file_0600() {
     local target="$1"
     local owner="${2:-}"
     local parent
     parent=$(dirname "$target")
-    mkdir -p "$parent"
+    mkdir -p "$parent" || return 1
     local tmp="${target}.tmp.$$"
-    (
+    if ! (
         umask 077
         cat > "$tmp"
-    )
-    chmod 600 "$tmp"
-    if [ -n "$owner" ] && [ "$(id -u)" -eq 0 ]; then
-        chown "${owner}:${owner}" "$tmp" 2>/dev/null || chown "${owner}" "$tmp"
+    ); then
+        rm -f "$tmp" 2>/dev/null || true
+        return 1
     fi
-    mv "$tmp" "$target"
-    chmod 600 "$target"
+    if ! chmod 600 "$tmp"; then
+        rm -f "$tmp" 2>/dev/null || true
+        return 1
+    fi
+    if [ -n "$owner" ] && [ "$(id -u)" -eq 0 ]; then
+        if ! (chown "${owner}:${owner}" "$tmp" 2>/dev/null || chown "${owner}" "$tmp"); then
+            rm -f "$tmp" 2>/dev/null || true
+            return 1
+        fi
+    fi
+    if ! mv "$tmp" "$target"; then
+        rm -f "$tmp" 2>/dev/null || true
+        return 1
+    fi
+    chmod 600 "$target" || return 1
 }
 
 # ------------------------------------------------------------------------------
@@ -229,6 +248,21 @@ fi
 if [ "$SKIP_APT" != "true" ] && ! command -v apt-get >/dev/null 2>&1; then
     log_error "Unsupported OS: apt-get not found. Only Debian 11+ / Ubuntu 22.04+ are supported."
     exit 1
+fi
+
+# Validate port inputs if provided
+if [ -n "$PORT_INPUT" ]; then
+    if ! [[ "$PORT_INPUT" =~ ^[0-9]+$ ]] || [ "$PORT_INPUT" -lt 1 ] || [ "$PORT_INPUT" -gt 65535 ]; then
+        log_error "Invalid PORT: ${PORT_INPUT} (must be 1..65535)"
+        exit 1
+    fi
+fi
+
+if [ -n "$INBOUND_PORT_INPUT" ]; then
+    if ! [[ "$INBOUND_PORT_INPUT" =~ ^[0-9]+$ ]] || [ "$INBOUND_PORT_INPUT" -lt 1 ] || [ "$INBOUND_PORT_INPUT" -gt 65535 ]; then
+        log_error "Invalid INBOUND_PORT: ${INBOUND_PORT_INPUT} (must be 1..65535)"
+        exit 1
+    fi
 fi
 
 # Record preexisting config BEFORE Step 2 installer runs (upstream installer creates empty {})
@@ -269,14 +303,6 @@ if [ "${#EXISTING_DETECTED[@]}" -gt 0 ] && [ "$ALLOW_EXISTING" != "true" ]; then
     exit 2
 fi
 
-# Validate port input if provided
-if [ -n "$PORT_INPUT" ]; then
-    if ! [[ "$PORT_INPUT" =~ ^[0-9]+$ ]] || [ "$PORT_INPUT" -lt 1 ] || [ "$PORT_INPUT" -gt 65535 ]; then
-        log_error "Invalid PORT: ${PORT_INPUT} (must be 1..65535)"
-        exit 1
-    fi
-fi
-
 # ------------------------------------------------------------------------------
 # 1. Install Essential Dependencies
 # ------------------------------------------------------------------------------
@@ -299,15 +325,30 @@ for req_cmd in jq openssl; do
 done
 
 # ------------------------------------------------------------------------------
-# 2. Install Pinned, Checksum-Verified Xray-core
+# 2. Install Pinned, Checksum-Verified Xray-core (Private 0700 Staging Dir)
 # ------------------------------------------------------------------------------
+INSTALLER_STAGE_DIR=""
+TMP_CONFIG=""
+cleanup_temp_artifacts() {
+    if [ -n "${TMP_CONFIG:-}" ] && [ -f "$TMP_CONFIG" ]; then
+        rm -f "$TMP_CONFIG" || true
+    fi
+    if [ -n "${INSTALLER_STAGE_DIR:-}" ] && [ -d "$INSTALLER_STAGE_DIR" ]; then
+        rm -f "${INSTALLER_STAGE_DIR}/install-release.sh" || true
+        rmdir "$INSTALLER_STAGE_DIR" 2>/dev/null || true
+    fi
+}
+trap cleanup_temp_artifacts EXIT
+
 XRAY_INSTALLED_BY_US=false
 if [ "$SKIP_XRAY_INSTALL" != "true" ]; then
     log_info "Step 2: Downloading pinned Xray installer (commit ${XRAY_INSTALL_COMMIT:0:10}, Xray ${XRAY_VERSION})..."
-    INSTALLER_TMP=$(mktemp /tmp/xray-install.XXXXXX.sh)
-    trap 'rm -f "${INSTALLER_TMP:-}" "${TMP_CONFIG:-}"' EXIT
+    INSTALLER_STAGE_DIR=$(umask 077 && mktemp -d "${TMPDIR:-/tmp}/xray-install.XXXXXX")
+    chmod 700 "$INSTALLER_STAGE_DIR"
+    INSTALLER_TMP="${INSTALLER_STAGE_DIR}/install-release.sh"
 
     curl -fsSL "$XRAY_INSTALL_URL" -o "$INSTALLER_TMP"
+    chmod 600 "$INSTALLER_TMP"
 
     if command -v sha256sum >/dev/null 2>&1; then
         ACTUAL_SHA256=$(sha256sum "$INSTALLER_TMP" | awk '{print $1}')
@@ -330,9 +371,10 @@ if [ "$SKIP_XRAY_INSTALL" != "true" ]; then
     bash "$INSTALLER_TMP" install --version "$XRAY_VERSION"
     XRAY_INSTALLED_BY_US=true
     rm -f "$INSTALLER_TMP"
+    rmdir "$INSTALLER_STAGE_DIR" 2>/dev/null || true
+    INSTALLER_STAGE_DIR=""
 else
     log_info "Step 2: Skipping Xray binary installation (SKIP_XRAY_INSTALL=true)."
-    trap 'rm -f "${TMP_CONFIG:-}"' EXIT
 fi
 
 if [ ! -x "$XRAY_BIN" ]; then
@@ -447,10 +489,21 @@ fi
 log_info "Reality credentials prepared (reused=${REUSED_CREDENTIALS})."
 
 # ------------------------------------------------------------------------------
-# 4. Kernel Tuning (with Rollback Backup)
+# 4. Kernel Tuning (with Persistent + Live Runtime Rollback Snapshot)
 # ------------------------------------------------------------------------------
 SYSCTL_BACKUP=""
 SYSCTL_MODIFIED=false
+SYSCTL_KEYS=(
+    "net.ipv6.conf.all.disable_ipv6"
+    "net.ipv6.conf.default.disable_ipv6"
+    "net.ipv6.conf.lo.disable_ipv6"
+    "net.ipv4.tcp_keepalive_time"
+    "net.ipv4.tcp_keepalive_intvl"
+    "net.ipv4.tcp_keepalive_probes"
+    "net.core.default_qdisc"
+    "net.ipv4.tcp_congestion_control"
+)
+SYSCTL_SAVED_PAIRS=()
 
 rollback_sysctl() {
     if [ "$SYSCTL_MODIFIED" = "true" ]; then
@@ -460,17 +513,32 @@ rollback_sysctl() {
             rm -f "$SYSCTL_FILE" || true
         fi
         sysctl --system >/dev/null 2>&1 || true
+        # Explicitly restore pre-run live kernel runtime values (sysctl --system alone
+        # does not reset keys absent from other /etc/sysctl.d files!)
+        local pair
+        for pair in "${SYSCTL_SAVED_PAIRS[@]}"; do
+            sysctl -w "$pair" >/dev/null 2>&1 || true
+        done
         SYSCTL_MODIFIED=false
-        log_warn "Rolled back sysctl configuration (${SYSCTL_FILE})."
+        log_warn "Rolled back sysctl file (${SYSCTL_FILE}) and restored pre-run live kernel values."
     fi
 }
 
 if [ "$SKIP_SYSCTL" != "true" ]; then
     log_info "Step 4: Tuning Linux Kernel parameters (Anti-leak & Keepalive)..."
+    # Snapshot live runtime values before mutating
+    for _k in "${SYSCTL_KEYS[@]}"; do
+        _v=$(sysctl -n "$_k" 2>/dev/null || true)
+        if [ -n "$_v" ]; then
+            SYSCTL_SAVED_PAIRS+=("${_k}=${_v}")
+        fi
+    done
+
     if [ -f "$SYSCTL_FILE" ]; then
         SYSCTL_BACKUP="${SYSCTL_FILE}.bak.$(date +%s)"
         cp "$SYSCTL_FILE" "$SYSCTL_BACKUP"
     fi
+    mkdir -p "$(dirname "$SYSCTL_FILE")"
     cat > "$SYSCTL_FILE" << 'EOF'
 # Disable IPv6 to prevent DNS and WebRTC leaks
 net.ipv6.conf.all.disable_ipv6 = 1
@@ -533,7 +601,9 @@ else
     log_info "Cloudflare WARP proxy verified active on 127.0.0.1:${WARP_PORT} (Dual-track enabled)."
 fi
 
-SERVER_IP="${SERVER_IP_OVERRIDE:-$(curl -s -4 -m 5 https://api.ipify.org || curl -s -4 -m 5 https://ipinfo.io/ip || curl -s -4 -m 5 https://icanhazip.com || echo "YOUR_VPS_IP")}"
+# Determine outbound egress IP vs. external client-facing inbound host (supports NAT VPS)
+EGRESS_IP="${EGRESS_IP_INPUT:-$(curl -s -4 -m 5 https://api.ipify.org || curl -s -4 -m 5 https://ipinfo.io/ip || curl -s -4 -m 5 https://icanhazip.com || echo "YOUR_VPS_IP")}"
+INBOUND_HOST="${INBOUND_HOST_INPUT:-${EGRESS_IP}}"
 
 # ------------------------------------------------------------------------------
 # 6. Build & Validate Candidate Xray Configuration (Least-Privilege Permissions)
@@ -746,10 +816,35 @@ fi
 log_info "Configuration validation passed."
 
 # ------------------------------------------------------------------------------
-# 7. Strict Firewall Enforcement BEFORE Mutating Active config.json (NO || true!)
+# 7. Strict Firewall Enforcement BEFORE Mutating Active config.json (Track for Rollback!)
 # ------------------------------------------------------------------------------
+FIREWALL_STATUS="none_detected"
+FIREWALL_RULE_ADDED=false
+FIREWALL_BACKEND=""
+
+rollback_firewall() {
+    if [ "$FIREWALL_RULE_ADDED" != "true" ]; then
+        return 0
+    fi
+    case "$FIREWALL_BACKEND" in
+        ufw)
+            ufw --force delete allow "${PORT}/tcp" >/dev/null 2>&1 || true
+            ;;
+        firewalld)
+            firewall-cmd --permanent --remove-port="${PORT}/tcp" >/dev/null 2>&1 || true
+            firewall-cmd --reload >/dev/null 2>&1 || true
+            ;;
+        iptables)
+            iptables -D INPUT -p tcp --dport "${PORT}" -j ACCEPT >/dev/null 2>&1 || true
+            ;;
+    esac
+    FIREWALL_RULE_ADDED=false
+    log_warn "Rolled back newly added ${FIREWALL_BACKEND} firewall rule for TCP port ${PORT}."
+}
+
 rollback_pre_deploy() {
     rm -f "$TMP_CONFIG"
+    rollback_firewall
     rollback_sysctl
     if [ "$HAD_PREEXISTING_CONFIG" != "true" ] && [ "$IS_EMPTY_STUB" = "true" ] && [ -f "$EXISTING_CONFIG" ]; then
         rm -f "$EXISTING_CONFIG" || true
@@ -761,22 +856,37 @@ rollback_pre_deploy() {
     fi
 }
 
-FIREWALL_STATUS="none_detected"
 if command -v ufw >/dev/null 2>&1 && ufw status 2>/dev/null | grep -q "Status: active"; then
     log_info "Step 7: Active UFW detected; allowing TCP port ${PORT}..."
+    UFW_PREEXISTING=false
+    if ufw status 2>/dev/null | grep -qE "(^|[[:space:]])${PORT}/tcp[[:space:]]+ALLOW"; then
+        UFW_PREEXISTING=true
+    fi
     if ! ufw allow "${PORT}/tcp"; then
         log_error "FAILED to allow port ${PORT}/tcp in UFW! Rolling back before touching active config.json."
         rollback_pre_deploy
         exit 1
     fi
+    if [ "$UFW_PREEXISTING" != "true" ]; then
+        FIREWALL_RULE_ADDED=true
+        FIREWALL_BACKEND="ufw"
+    fi
     FIREWALL_STATUS="ufw_allowed"
     log_info "Confirmed: UFW allowed TCP port ${PORT}."
 elif command -v firewall-cmd >/dev/null 2>&1 && firewall-cmd --state >/dev/null 2>&1; then
     log_info "Step 7: Active firewalld detected; allowing TCP port ${PORT}..."
-    if ! firewall-cmd --permanent --add-port="${PORT}/tcp" || ! firewall-cmd --reload; then
-        log_error "FAILED to allow port ${PORT}/tcp in firewalld! Rolling back before touching active config.json."
-        rollback_pre_deploy
-        exit 1
+    FWD_PREEXISTING=false
+    if firewall-cmd --query-port="${PORT}/tcp" >/dev/null 2>&1; then
+        FWD_PREEXISTING=true
+    fi
+    if [ "$FWD_PREEXISTING" != "true" ]; then
+        if ! firewall-cmd --permanent --add-port="${PORT}/tcp" || ! firewall-cmd --reload; then
+            log_error "FAILED to allow port ${PORT}/tcp in firewalld! Rolling back before touching active config.json."
+            rollback_pre_deploy
+            exit 1
+        fi
+        FIREWALL_RULE_ADDED=true
+        FIREWALL_BACKEND="firewalld"
     fi
     FIREWALL_STATUS="firewalld_allowed"
     log_info "Confirmed: firewalld allowed TCP port ${PORT}."
@@ -788,13 +898,15 @@ elif command -v iptables >/dev/null 2>&1; then
             rollback_pre_deploy
             exit 1
         fi
+        FIREWALL_RULE_ADDED=true
+        FIREWALL_BACKEND="iptables"
     fi
     FIREWALL_STATUS="iptables_allowed"
     log_info "Confirmed: iptables allows TCP port ${PORT}."
 fi
 
 # ------------------------------------------------------------------------------
-# 8. Atomic Deployment, Service Restart & Local Listening Verification (with Rollback)
+# 8. Atomic Deployment, Service Restart & Local Listening Verification (Full Rollback)
 # ------------------------------------------------------------------------------
 BACKUP_PATH=""
 if [ "$TREAT_AS_EXISTING" = "true" ] && [ -f "$EXISTING_CONFIG" ]; then
@@ -816,8 +928,9 @@ rollback_deployed_config() {
         rm -f "$EXISTING_CONFIG" || true
         systemctl stop xray >/dev/null 2>&1 || true
     fi
+    rollback_firewall
     rollback_sysctl
-    log_warn "修复问题后可使用 ALLOW_EXISTING=true bash vps_setup.sh 重试。"
+    log_warn "已完整回滚配置、新增防火墙规则与 sysctl；修复问题后可使用 ALLOW_EXISTING=true bash vps_setup.sh 重试。"
 }
 
 # Atomic replacement preserving least-privilege permissions (0640 root:xray or 0600)
@@ -858,8 +971,9 @@ fi
 
 # ------------------------------------------------------------------------------
 # 9. Derive Delivered Metadata Strictly From Final Active config.json (0600 File)
+#    With Transactional Rollback if Node Metadata Delivery Fails!
 # ------------------------------------------------------------------------------
-FINAL_PORT=$(jq -r '.inbounds[0].port // empty' "$EXISTING_CONFIG")
+FINAL_LISTEN_PORT=$(jq -r '.inbounds[0].port // empty' "$EXISTING_CONFIG")
 FINAL_UUID=$(jq -r '.inbounds[0].settings.clients[0].id // empty' "$EXISTING_CONFIG")
 FINAL_SNI=$(jq -r '.inbounds[0].streamSettings.realitySettings.serverNames[0] // empty' "$EXISTING_CONFIG")
 FINAL_PRIVATE_KEY=$(jq -r '.inbounds[0].streamSettings.realitySettings.privateKey // empty' "$EXISTING_CONFIG")
@@ -869,16 +983,21 @@ if [ -n "$FINAL_PRIVATE_KEY" ]; then
     FINAL_PUBLIC_KEY=$(derive_public_key_stdin "$FINAL_PRIVATE_KEY" || true)
 fi
 
-if [ -z "$FINAL_PORT" ] || [ -z "$FINAL_UUID" ] || [ -z "$FINAL_SNI" ] || [ -z "$FINAL_PUBLIC_KEY" ]; then
+if [ -z "$FINAL_LISTEN_PORT" ] || [ -z "$FINAL_UUID" ] || [ -z "$FINAL_SNI" ] || [ -z "$FINAL_PUBLIC_KEY" ]; then
     log_error "Internal consistency check failed when reading final config ${EXISTING_CONFIG}!"
     rollback_deployed_config
     exit 1
 fi
 
+FINAL_INBOUND_PORT="${INBOUND_PORT_INPUT:-${FINAL_LISTEN_PORT}}"
+
 # Zero secret exposure in jq argv: read uuid/short_id directly from config.json, pipe public_key on stdin!
+# Explicitly record separate listen_port, inbound_host, inbound_port, egress_ip (plus server_ip & port aliases).
 METADATA_JSON=$(printf '%s' "$FINAL_PUBLIC_KEY" | jq -Rs \
     --slurpfile cfg "$EXISTING_CONFIG" \
-    --arg server_ip "$SERVER_IP" \
+    --arg inbound_host "$INBOUND_HOST" \
+    --argjson inbound_port "$FINAL_INBOUND_PORT" \
+    --arg egress_ip "$EGRESS_IP" \
     --arg security "reality" \
     --arg fingerprint "chrome" \
     --argjson warp_port "$WARP_PORT" \
@@ -886,8 +1005,12 @@ METADATA_JSON=$(printf '%s' "$FINAL_PUBLIC_KEY" | jq -Rs \
     --arg google_outbound "$GOOGLE_OUTBOUND" \
     --arg firewall_status "$FIREWALL_STATUS" \
     '{
-      server_ip: $server_ip,
-      port: $cfg[0].inbounds[0].port,
+      server_ip: $inbound_host,
+      port: $inbound_port,
+      inbound_host: $inbound_host,
+      inbound_port: $inbound_port,
+      listen_port: $cfg[0].inbounds[0].port,
+      egress_ip: $egress_ip,
       uuid: $cfg[0].inbounds[0].settings.clients[0].id,
       flow: ($cfg[0].inbounds[0].settings.clients[0].flow // "xtls-rprx-vision"),
       security: $security,
@@ -901,12 +1024,17 @@ METADATA_JSON=$(printf '%s' "$FINAL_PUBLIC_KEY" | jq -Rs \
       firewall_status: $firewall_status
     }')
 
-printf '%s\n' "$METADATA_JSON" | write_secret_file_0600 "$OUTPUT_FILE" "$OUTPUT_OWNER"
+if ! printf '%s\n' "$METADATA_JSON" | write_secret_file_0600 "$OUTPUT_FILE" "$OUTPUT_OWNER"; then
+    log_error "Failed to write node metadata file to ${OUTPUT_FILE}! Rolling back deployed config, firewall rule, and sysctl."
+    rollback_deployed_config
+    exit 1
+fi
 
 echo ""
 echo "==================== VPS SETUP COMPLETE ===================="
-echo "Server IP        : ${SERVER_IP}"
-echo "Listening Port   : ${FINAL_PORT}/tcp"
+echo "Inbound Endpoint : ${INBOUND_HOST}:${FINAL_INBOUND_PORT}/tcp"
+echo "Local Listen Port: ${FINAL_LISTEN_PORT}/tcp"
+echo "Expected Egress  : ${EGRESS_IP}"
 echo "SNI              : ${FINAL_SNI}"
 echo "Service Group    : ${ACTIVE_XRAY_GROUP:-none (0600)}"
 echo "WARP Dual-Track  : ${WARP_READY} (Google outbound: ${GOOGLE_OUTBOUND})"
@@ -914,9 +1042,9 @@ echo "VPS Firewall     : ${FIREWALL_STATUS}"
 echo "Metadata File    : ${OUTPUT_FILE} (permissions: 0600${OUTPUT_OWNER:+, owner: ${OUTPUT_OWNER}})"
 echo ""
 echo "[NEXT STEP] Copy ${OUTPUT_FILE} securely to your local machine via scp (do NOT paste secrets into chat),"
-echo "            then verify inbound TCP port reachability + proxy egress from your local machine."
+echo "            then verify inbound TCP port reachability + HTTPS proxy egress from your local machine."
 echo "[NOTE]      Cloud provider security groups (AWS/GCP/Aliyun/etc.) are separate from VPS ufw/iptables:"
-echo "            ensure TCP port ${FINAL_PORT} is open in your cloud console if client reachability fails."
+echo "            ensure TCP port ${FINAL_INBOUND_PORT} (local ${FINAL_LISTEN_PORT}) is open in your cloud console if client reachability fails."
 
 if [ "$PRINT_JSON" = "true" ]; then
     echo ""
