@@ -1,15 +1,14 @@
 #!/usr/bin/env python3
 """
-Generate a hardened, anti-leak Clash Verge / Mihomo YAML profile and VLESS Share Link
-from VPS setup output.
+Generate a hardened, anti-leak Clash Verge / Mihomo YAML profile and mobile VLESS link
+from a restricted (0600) VPS node metadata JSON file.
 
-Battle-tested design:
-- Fake-IP + GEOSITE,geolocation-!cn + GEOIP,CN,DIRECT,no-resolve:
-  Zero domestic DNS leak for overseas domains AND zero GFW DoH hang.
-- Blocks UDP 443 (QUIC) to prevent browser UDP bypass/leak.
-- Dedicated AI group locked to the user's native residential US VPS.
-- Complete rules for Claude/Anthropic (incl. Persona/Turnstile), OpenAI/ChatGPT,
-  Google/Gemini/YouTube, Twitter/X (incl. twimg/t.co), and dev ecosystem.
+Security & correctness features:
+- Prefers --json-file <path> so credentials never appear in CLI argv / shell history.
+- Writes both the Clash YAML profile and mobile VLESS link to 0600 files (no raw
+  secrets printed to stdout unless --print-vless is explicitly passed).
+- Supports valid empty Reality short_id ("") without breaking YAML or VLESS URLs.
+- Fake-IP + GEOSITE,geolocation-!cn + GEOIP,CN,DIRECT,no-resolve + UDP 443 REJECT.
 """
 
 import argparse
@@ -168,6 +167,19 @@ rules:
 """
 
 
+def write_file_0600(path, content):
+    parent = os.path.dirname(os.path.abspath(path))
+    if parent:
+        os.makedirs(parent, exist_ok=True)
+    if os.path.exists(path):
+        os.chmod(path, 0o600)
+    flags = os.O_WRONLY | os.O_CREAT | os.O_TRUNC
+    fd = os.open(path, flags, 0o600)
+    with open(fd, "w", encoding="utf-8") as f:
+        f.write(content)
+    os.chmod(path, 0o600)
+
+
 def generate_vless_url(node):
     params = {
         "security": "reality",
@@ -178,7 +190,7 @@ def generate_vless_url(node):
         "type": "tcp",
         "flow": node.get("flow", "xtls-rprx-vision"),
         "sni": node["sni"],
-        "sid": node["short_id"]
+        "sid": node["short_id"],
     }
     query_str = urllib.parse.urlencode(params)
     name_encoded = urllib.parse.quote(node.get("node_name", "🇺🇸 独享-Claude-原生住宅9929"))
@@ -186,49 +198,86 @@ def generate_vless_url(node):
 
 
 def main():
-    parser = argparse.ArgumentParser(description="Generate Clash Verge / Mihomo profile and VLESS URL")
-    parser.add_argument("--json-input", help="Path to JSON file or raw JSON string from vps_setup.sh")
+    parser = argparse.ArgumentParser(
+        description="Generate Clash Verge / Mihomo profile and mobile VLESS link (0600 file handoff)"
+    )
+    parser.add_argument(
+        "--json-file",
+        help="Path to restricted (0600) node metadata JSON file fetched from VPS (recommended)",
+    )
+    parser.add_argument(
+        "--json-input",
+        help="Legacy alias: path to JSON file (passing raw JSON strings on CLI is discouraged)",
+    )
     parser.add_argument("--ip", help="VPS Server IPv4")
     parser.add_argument("--port", type=int, default=24433, help="Port (default: 24433)")
     parser.add_argument("--uuid", help="Client UUID")
     parser.add_argument("--public-key", help="Reality Public Key")
-    parser.add_argument("--short-id", help="Reality Short ID")
+    parser.add_argument("--short-id", default=None, help="Reality Short ID (empty string '' is valid)")
     parser.add_argument("--sni", default="gateway.icloud.com", help="Server SNI (default: gateway.icloud.com)")
     parser.add_argument("--name", default="🇺🇸 独享-Claude-原生住宅9929", help="Node display name")
-    parser.add_argument("--output", default="Claude-AntiBan-Profile.yaml", help="Output YAML path")
+    parser.add_argument("--output", default="Claude-AntiBan-Profile.yaml", help="Output Clash YAML path")
+    parser.add_argument(
+        "--vless-output",
+        default=None,
+        help="Output path for 0600 mobile VLESS share link file (default: <output-stem>-mobile-vless.txt)",
+    )
+    parser.add_argument(
+        "--print-vless",
+        action="store_true",
+        help="Also print raw VLESS URL to stdout (off by default to keep secrets out of logs/chat)",
+    )
 
     args = parser.parse_args()
 
     data = {}
-    if args.json_input:
-        if os.path.exists(args.json_input):
-            with open(args.json_input, "r", encoding="utf-8") as f:
+    json_source = args.json_file or args.json_input
+    if json_source:
+        expanded = os.path.expanduser(json_source)
+        if os.path.exists(expanded):
+            with open(expanded, "r", encoding="utf-8") as f:
                 data = json.load(f)
         else:
-            data = json.loads(args.json_input)
+            if args.json_file:
+                print(f"[ERROR] JSON metadata file not found: {expanded}", file=sys.stderr)
+                sys.exit(1)
+            print(
+                "[SECURITY WARN] Passing raw credentials JSON via CLI argument exposes UUID to process lists and shell history. Prefer --json-file <0600-path>.",
+                file=sys.stderr,
+            )
+            data = json.loads(json_source)
 
     server_ip = data.get("server_ip") or args.ip
-    port = data.get("port") or args.port
+    port = data.get("port") if data.get("port") is not None else args.port
     uuid = data.get("uuid") or args.uuid
     public_key = data.get("public_key") or args.public_key
-    short_id = data.get("short_id") or args.short_id
     sni = data.get("sni") or args.sni
     flow = data.get("flow") or "xtls-rprx-vision"
     fingerprint = data.get("fingerprint") or "chrome"
     node_name = args.name
 
-    if not all([server_ip, port, uuid, public_key, short_id, sni]):
-        print("Error: Missing required connection parameters (server_ip, port, uuid, public_key, short_id, sni)!", file=sys.stderr)
+    # Explicitly preserve valid empty string short_id == ""
+    if "short_id" in data and data["short_id"] is not None:
+        short_id = str(data["short_id"])
+    elif args.short_id is not None:
+        short_id = str(args.short_id)
+    else:
+        short_id = None
+
+    if not all([server_ip, port, uuid, public_key, sni]) or short_id is None:
+        print(
+            "[ERROR] Missing required connection parameters (server_ip, port, uuid, public_key, short_id, sni)!",
+            file=sys.stderr,
+        )
         sys.exit(1)
 
     output_path = os.path.expanduser(args.output)
-    output_dir = os.path.dirname(os.path.abspath(output_path))
-    if output_dir:
-        os.makedirs(output_dir, exist_ok=True)
+    if args.vless_output:
+        vless_output_path = os.path.expanduser(args.vless_output)
+    else:
+        stem, _ = os.path.splitext(output_path)
+        vless_output_path = f"{stem}-mobile-vless.txt"
 
-    # Use standard JSON string dumps for YAML flow scalars.
-    # Standard JSON string literals are fully valid YAML 1.2 double-quoted strings,
-    # correctly handling all backslashes, quotes, octals/integers (like short-id), and control chars.
     node_dict = {
         "server_ip_yaml": json.dumps(str(server_ip), ensure_ascii=False),
         "port": int(port),
@@ -238,40 +287,42 @@ def main():
         "public_key_yaml": json.dumps(str(public_key), ensure_ascii=False),
         "short_id_yaml": json.dumps(str(short_id), ensure_ascii=False),
         "fingerprint_yaml": json.dumps(str(fingerprint), ensure_ascii=False),
-        "node_name_yaml": json.dumps(str(node_name), ensure_ascii=False)
+        "node_name_yaml": json.dumps(str(node_name), ensure_ascii=False),
     }
 
     yaml_content = TEMPLATE_YAML.format(**node_dict)
 
-    # Restrict file permissions to 0600 on creation/write (owner read/write only)
     try:
-        if os.path.exists(output_path):
-            os.chmod(output_path, 0o600)
-        flags = os.O_WRONLY | os.O_CREAT | os.O_TRUNC
-        fd = os.open(output_path, flags, 0o600)
-        with open(fd, "w", encoding="utf-8") as f:
-            f.write(yaml_content)
-        os.chmod(output_path, 0o600)
-        print(f"\n[SUCCESS] Generated Clash YAML Profile: {os.path.abspath(output_path)}")
-        print(f"[SECURITY] Set file permissions to 0600: {os.path.abspath(output_path)}")
+        write_file_0600(output_path, yaml_content)
+        print(f"[SUCCESS] Generated Clash YAML Profile (0600): {os.path.abspath(output_path)}")
     except Exception as e:
-        print(f"\n[ERROR] Failed to write profile to {output_path} with 0600 permissions: {e}", file=sys.stderr)
+        print(f"[ERROR] Failed to write Clash profile to {output_path}: {e}", file=sys.stderr)
         sys.exit(1)
 
-    vless_node_info = {
-        "server_ip": server_ip,
-        "port": port,
-        "uuid": uuid,
-        "flow": flow,
-        "sni": sni,
-        "public_key": public_key,
-        "short_id": short_id,
-        "fingerprint": fingerprint,
-        "node_name": node_name
-    }
-    vless_url = generate_vless_url(vless_node_info)
+    vless_url = generate_vless_url(
+        {
+            "server_ip": server_ip,
+            "port": int(port),
+            "uuid": uuid,
+            "flow": flow,
+            "sni": sni,
+            "public_key": public_key,
+            "short_id": short_id,
+            "fingerprint": fingerprint,
+            "node_name": node_name,
+        }
+    )
 
-    print(f"\n[VLESS Share Link (for iOS Shadowrocket / Sing-box / Loon)]:\n{vless_url}\n")
+    try:
+        write_file_0600(vless_output_path, vless_url + "\n")
+        print(f"[SUCCESS] Saved mobile VLESS share link (0600): {os.path.abspath(vless_output_path)}")
+        print("[SECURITY] Raw VLESS link was NOT printed to stdout to prevent leaking credentials into chat/logs.")
+    except Exception as e:
+        print(f"[ERROR] Failed to write VLESS share link to {vless_output_path}: {e}", file=sys.stderr)
+        sys.exit(1)
+
+    if args.print_vless:
+        print(f"\n[VLESS Share Link]:\n{vless_url}\n")
 
 
 if __name__ == "__main__":
