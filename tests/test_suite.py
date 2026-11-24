@@ -185,6 +185,60 @@ class TestGenerateClashConfig(unittest.TestCase):
             ovr_vless = (Path(tmp) / "override-mobile-vless.txt").read_text(encoding="utf-8").strip()
             self.assertIn("@198.51.100.77:45555?", ovr_vless)
 
+    def test_rejects_placeholder_and_invalid_server_host(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            node_file = Path(tmp) / "bad-node.json"
+            yaml_file = Path(tmp) / "out.yaml"
+            node_file.write_text(
+                json.dumps(
+                    {
+                        "server_ip": "YOUR_VPS_IP",
+                        "port": 24433,
+                        "uuid": "11111111-2222-3333-4444-555555555555",
+                        "public_key": ALICE_PUB,
+                        "short_id": "aabbccdd",
+                        "sni": "gateway.icloud.com",
+                    }
+                ),
+                encoding="utf-8",
+            )
+            res = subprocess.run(
+                [
+                    sys.executable,
+                    str(SCRIPTS_DIR / "generate_clash_config.py"),
+                    "--json-file",
+                    str(node_file),
+                    "--output",
+                    str(yaml_file),
+                ],
+                capture_output=True,
+                text=True,
+            )
+            self.assertNotEqual(res.returncode, 0)
+            self.assertIn("Invalid or placeholder server address", res.stderr)
+            self.assertFalse(yaml_file.exists())
+
+            # Also reject out-of-range port
+            res_port = subprocess.run(
+                [
+                    sys.executable,
+                    str(SCRIPTS_DIR / "generate_clash_config.py"),
+                    "--json-file",
+                    str(node_file),
+                    "--ip",
+                    "203.0.113.10",
+                    "--port",
+                    "99999",
+                    "--output",
+                    str(yaml_file),
+                ],
+                capture_output=True,
+                text=True,
+            )
+            self.assertNotEqual(res_port.returncode, 0)
+            self.assertIn("Invalid TCP port", res_port.stderr)
+            self.assertFalse(yaml_file.exists())
+
 
 class TestVerifyEnvironment(unittest.TestCase):
     def test_forced_proxy_handler_ignores_no_proxy_env(self):
@@ -492,7 +546,7 @@ exec "{real_jq}" "$@"
             )
             spy_jq.chmod(0o755)
 
-        # Optional mock sysctl tracking live kernel runtime values
+        # Optional mock sysctl tracking live kernel runtime values (including Linux all.disable_ipv6 propagation!)
         if enable_mock_sysctl:
             sysctl_state.write_text(
                 "\n".join(
@@ -500,6 +554,8 @@ exec "{real_jq}" "$@"
                         "net.ipv6.conf.all.disable_ipv6=0",
                         "net.ipv6.conf.default.disable_ipv6=0",
                         "net.ipv6.conf.lo.disable_ipv6=0",
+                        "net.ipv6.conf.eth0.disable_ipv6=0",
+                        "net.ipv6.conf.eth1.disable_ipv6=1",
                         "net.ipv4.tcp_keepalive_time=7200",
                         "net.ipv4.tcp_keepalive_intvl=75",
                         "net.ipv4.tcp_keepalive_probes=9",
@@ -514,15 +570,37 @@ exec "{real_jq}" "$@"
             mock_sysctl.write_text(
                 f"""#!/usr/bin/env bash
 STATE="{sysctl_state}"
+apply_kv() {{
+    local key="$1"
+    local val="$2"
+    if [ "$key" = "net.ipv6.conf.all.disable_ipv6" ]; then
+        # Simulate Linux kernel: writing all.disable_ipv6 propagates to every interface!
+        awk -F= -v v="$val" '
+            /^net\\.ipv6\\.conf\\.[^.]+\\.disable_ipv6=/ {{
+                if ($1 != "net.ipv6.conf.default.disable_ipv6") {{
+                    print $1 "=" v
+                    next
+                }}
+            }}
+            {{ print }}
+        ' "$STATE" > "${{STATE}}.tmp"
+        mv "${{STATE}}.tmp" "$STATE"
+    else
+        grep -v "^${{key}}=" "$STATE" > "${{STATE}}.tmp" || true
+        printf "%s=%s\\n" "$key" "$val" >> "${{STATE}}.tmp"
+        mv "${{STATE}}.tmp" "$STATE"
+    fi
+}}
 if [ "$1" = "-n" ]; then
     grep "^$2=" "$STATE" | head -n 1 | cut -d'=' -f2-
+    exit 0
+elif [ "$1" = "net.ipv6.conf" ]; then
+    grep "^net\\.ipv6\\.conf\\." "$STATE" | sed 's/=/ = /'
     exit 0
 elif [ "$1" = "-w" ]; then
     key="${{2%%=*}}"
     val="${{2#*=}}"
-    grep -v "^${{key}}=" "$STATE" > "${{STATE}}.tmp" || true
-    printf "%s=%s\\n" "$key" "$val" >> "${{STATE}}.tmp"
-    mv "${{STATE}}.tmp" "$STATE"
+    apply_kv "$key" "$val"
     exit 0
 elif [ "$1" = "--system" ]; then
     if [ -f "${{SYSCTL_FILE:-/nonexistent}}" ]; then
@@ -532,9 +610,7 @@ elif [ "$1" = "--system" ]; then
             esac
             k=$(printf "%s" "$line" | cut -d'=' -f1 | tr -d ' ')
             v=$(printf "%s" "$line" | cut -d'=' -f2- | tr -d ' ')
-            grep -v "^${{k}}=" "$STATE" > "${{STATE}}.tmp" || true
-            printf "%s=%s\\n" "$k" "$v" >> "${{STATE}}.tmp"
-            mv "${{STATE}}.tmp" "$STATE"
+            apply_kv "$k" "$v"
         done < "${{SYSCTL_FILE}}"
     fi
     exit 0
@@ -892,9 +968,13 @@ exit 0
             self.assertIn("allow 24433/tcp", ufw_log)
             self.assertIn("--force delete allow 24433/tcp", ufw_log)
 
-            # Live kernel runtime values must be restored (not stuck at modified values)
+            # Live kernel runtime values must be restored (including heterogeneous per-interface IPv6!)
             sysctl_state = (tmp_path / "sysctl.state").read_text(encoding="utf-8")
             self.assertIn("net.ipv6.conf.all.disable_ipv6=0", sysctl_state)
+            self.assertIn("net.ipv6.conf.default.disable_ipv6=0", sysctl_state)
+            self.assertIn("net.ipv6.conf.lo.disable_ipv6=0", sysctl_state)
+            self.assertIn("net.ipv6.conf.eth0.disable_ipv6=0", sysctl_state)
+            self.assertIn("net.ipv6.conf.eth1.disable_ipv6=1", sysctl_state)
             self.assertIn("net.ipv4.tcp_keepalive_time=7200", sysctl_state)
             self.assertIn("net.ipv4.tcp_congestion_control=cubic", sysctl_state)
 
@@ -958,6 +1038,151 @@ exit 0
             self.assertEqual(meta["egress_ip"], "203.0.113.88")
             self.assertEqual(meta["server_ip"], "nat.example.com")
             self.assertEqual(meta["port"], 34433)
+
+    def test_firewalld_perm_add_then_reload_failure_and_runtime_isolation(self):
+        # Case 1: --permanent --add-port succeeds, --reload fails -> permanent rule MUST be rolled back!
+        with tempfile.TemporaryDirectory() as tmp:
+            tmp_path, cfg_dir, env, _, _ = self._create_sandbox(tmp)
+            bin_dir = tmp_path / "bin"
+            # Disable ufw so firewalld branch executes
+            (bin_dir / "ufw").unlink()
+            perm_file = tmp_path / "fwd_perm.txt"
+            rt_file = tmp_path / "fwd_rt.txt"
+            perm_file.write_text("", encoding="utf-8")
+            rt_file.write_text("", encoding="utf-8")
+
+            mock_fwd = bin_dir / "firewall-cmd"
+            mock_fwd.write_text(
+                f"""#!/usr/bin/env bash
+PERM="{perm_file}"
+RT="{rt_file}"
+case "$*" in
+    "--state") echo "running"; exit 0 ;;
+    "--permanent --query-port="*)
+        p="${{2#--query-port=}}"
+        grep -qx "$p" "$PERM" && exit 0 || exit 1 ;;
+    "--query-port="*)
+        p="${{1#--query-port=}}"
+        grep -qx "$p" "$RT" && exit 0 || exit 1 ;;
+    "--permanent --add-port="*)
+        p="${{2#--add-port=}}"
+        echo "$p" >> "$PERM"
+        exit 0 ;;
+    "--permanent --remove-port="*)
+        p="${{2#--remove-port=}}"
+        grep -vx "$p" "$PERM" > "${{PERM}}.tmp" || true
+        mv "${{PERM}}.tmp" "$PERM"
+        exit 0 ;;
+    "--remove-port="*)
+        p="${{1#--remove-port=}}"
+        grep -vx "$p" "$RT" > "${{RT}}.tmp" || true
+        mv "${{RT}}.tmp" "$RT"
+        exit 0 ;;
+    "--reload")
+        exit 1 ;;
+esac
+exit 0
+""",
+                encoding="utf-8",
+            )
+            mock_fwd.chmod(0o755)
+
+            res = subprocess.run(
+                ["bash", str(SCRIPTS_DIR / "vps_setup.sh")],
+                env=env,
+                capture_output=True,
+                text=True,
+            )
+            self.assertNotEqual(res.returncode, 0)
+            self.assertEqual(perm_file.read_text(encoding="utf-8").strip(), "")
+            self.assertFalse((cfg_dir / "config.json").exists())
+
+        # Case 2: Runtime already had 24433/tcp, permanent did not -> Xray restart fails ->
+        # rollback removes ONLY permanent rule and preserves pre-existing runtime rule!
+        with tempfile.TemporaryDirectory() as tmp:
+            tmp_path, cfg_dir, env, _, _ = self._create_sandbox(tmp, systemctl_restart_fail=True)
+            bin_dir = tmp_path / "bin"
+            (bin_dir / "ufw").unlink()
+            perm_file = tmp_path / "fwd_perm.txt"
+            rt_file = tmp_path / "fwd_rt.txt"
+            perm_file.write_text("", encoding="utf-8")
+            rt_file.write_text("24433/tcp\n", encoding="utf-8")
+
+            mock_fwd = bin_dir / "firewall-cmd"
+            mock_fwd.write_text(
+                f"""#!/usr/bin/env bash
+PERM="{perm_file}"
+RT="{rt_file}"
+case "$*" in
+    "--state") echo "running"; exit 0 ;;
+    "--permanent --query-port="*)
+        p="${{2#--query-port=}}"
+        grep -qx "$p" "$PERM" && exit 0 || exit 1 ;;
+    "--query-port="*)
+        p="${{1#--query-port=}}"
+        grep -qx "$p" "$RT" && exit 0 || exit 1 ;;
+    "--permanent --add-port="*)
+        p="${{2#--add-port=}}"
+        echo "$p" >> "$PERM"
+        exit 0 ;;
+    "--permanent --remove-port="*)
+        p="${{2#--remove-port=}}"
+        grep -vx "$p" "$PERM" > "${{PERM}}.tmp" || true
+        mv "${{PERM}}.tmp" "$PERM"
+        exit 0 ;;
+    "--remove-port="*)
+        p="${{1#--remove-port=}}"
+        grep -vx "$p" "$RT" > "${{RT}}.tmp" || true
+        mv "${{RT}}.tmp" "$RT"
+        exit 0 ;;
+    "--reload")
+        cp "$PERM" "$RT"
+        exit 0 ;;
+esac
+exit 0
+""",
+                encoding="utf-8",
+            )
+            mock_fwd.chmod(0o755)
+
+            res = subprocess.run(
+                ["bash", str(SCRIPTS_DIR / "vps_setup.sh")],
+                env=env,
+                capture_output=True,
+                text=True,
+            )
+            self.assertNotEqual(res.returncode, 0)
+            self.assertEqual(perm_file.read_text(encoding="utf-8").strip(), "")
+            self.assertEqual(rt_file.read_text(encoding="utf-8").strip(), "24433/tcp")
+
+    def test_public_ip_probe_failure_aborts_in_preflight_before_any_mutation(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            tmp_path, cfg_dir, env, _, _ = self._create_sandbox(
+                tmp, use_upstream_installer=True, enable_mock_sysctl=True
+            )
+            bin_dir = tmp_path / "bin"
+            # Mock curl that always fails for egress probes
+            mock_curl = bin_dir / "curl"
+            mock_curl.write_text("#!/usr/bin/env bash\nexit 7\n", encoding="utf-8")
+            mock_curl.chmod(0o755)
+
+            env.pop("SERVER_IP_OVERRIDE", None)
+            env.pop("EGRESS_IP", None)
+
+            res = subprocess.run(
+                ["bash", str(SCRIPTS_DIR / "vps_setup.sh")],
+                env=env,
+                capture_output=True,
+                text=True,
+            )
+            self.assertNotEqual(res.returncode, 0)
+            self.assertIn("Failed to auto-detect a valid public IPv4", res.stderr)
+            self.assertNotIn("YOUR_VPS_IP", res.stdout)
+            # Zero mutations occurred: no xray installed, no sysctl file, no config, no node.json
+            self.assertFalse(Path(env["XRAY_BIN"]).exists())
+            self.assertFalse(Path(env["SYSCTL_FILE"]).exists())
+            self.assertFalse((cfg_dir / "config.json").exists())
+            self.assertFalse((tmp_path / "node.json").exists())
 
 
 if __name__ == "__main__":

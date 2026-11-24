@@ -104,6 +104,53 @@ log_info() { echo -e "${GREEN}[INFO]${NC} $1"; }
 log_warn() { echo -e "${YELLOW}[WARN]${NC} $1"; }
 log_error() { echo -e "${RED}[ERROR]${NC} $1" >&2; }
 
+# Helper: strict IPv4 validator (rejects placeholders like YOUR_VPS_IP or HTML errors)
+is_valid_ipv4() {
+    local ip="$1"
+    if ! [[ "$ip" =~ ^([0-9]{1,3}\.){3}[0-9]{1,3}$ ]]; then
+        return 1
+    fi
+    local IFS='.'
+    local o1 o2 o3 o4
+    read -r o1 o2 o3 o4 <<< "$ip"
+    for octet in "$o1" "$o2" "$o3" "$o4"; do
+        if [ "$octet" -gt 255 ]; then
+            return 1
+        fi
+    done
+    return 0
+}
+
+# Helper: validate inbound host (IPv4 or RFC hostname; rejects placeholders/whitespace)
+is_valid_host() {
+    local h="$1"
+    if [ -z "$h" ] || [ "$h" = "YOUR_VPS_IP" ]; then
+        return 1
+    fi
+    if is_valid_ipv4 "$h"; then
+        return 0
+    fi
+    # Valid DNS hostname (no underscores, spaces, or angle brackets)
+    if [[ "$h" =~ ^[A-Za-z0-9]([A-Za-z0-9-]{0,61}[A-Za-z0-9])?(\.[A-Za-z0-9]([A-Za-z0-9-]{0,61}[A-Za-z0-9])?)*$ ]]; then
+        return 0
+    fi
+    return 1
+}
+
+# Helper: probe public IPv4 egress via HTTPS endpoints (configurable for tests)
+EGRESS_PROBE_URLS="${EGRESS_PROBE_URLS:-https://api.ipify.org https://ipinfo.io/ip https://icanhazip.com}"
+detect_public_ipv4() {
+    local url candidate
+    for url in $EGRESS_PROBE_URLS; do
+        candidate=$(curl -fsS -4 -m 5 "$url" 2>/dev/null | tr -d ' \t\r\n' || true)
+        if is_valid_ipv4 "$candidate"; then
+            printf '%s' "$candidate"
+            return 0
+        fi
+    done
+    return 1
+}
+
 # Helper: derive X25519 PublicKey from raw base64url PrivateKey via stdin ONLY
 # (RFC 7748; zero secrets ever passed in child-process CLI argv!)
 derive_public_key_stdin() {
@@ -263,6 +310,32 @@ if [ -n "$INBOUND_PORT_INPUT" ]; then
         log_error "Invalid INBOUND_PORT: ${INBOUND_PORT_INPUT} (must be 1..65535)"
         exit 1
     fi
+fi
+
+# Resolve & strictly validate outbound EGRESS_IP and client INBOUND_HOST BEFORE ANY SYSTEM MUTATION!
+if [ -n "$EGRESS_IP_INPUT" ]; then
+    if ! is_valid_ipv4 "$EGRESS_IP_INPUT"; then
+        log_error "Invalid EGRESS_IP: '${EGRESS_IP_INPUT}' (must be a valid IPv4 address)."
+        exit 1
+    fi
+    EGRESS_IP="$EGRESS_IP_INPUT"
+else
+    if ! command -v curl >/dev/null 2>&1; then
+        log_error "curl is required to auto-detect public IPv4 (or pass EGRESS_IP=<VPS公网IPv4> explicitly)."
+        exit 1
+    fi
+    if ! EGRESS_IP=$(detect_public_ipv4); then
+        log_error "Failed to auto-detect a valid public IPv4 from HTTPS probe endpoints (${EGRESS_PROBE_URLS})."
+        log_error "Aborting BEFORE making any changes to the VPS to avoid generating broken configs."
+        log_error "Please re-run with an explicit valid IPv4: EGRESS_IP=<VPS公网IPv4> bash vps_setup.sh"
+        exit 1
+    fi
+fi
+
+INBOUND_HOST="${INBOUND_HOST_INPUT:-${EGRESS_IP}}"
+if ! is_valid_host "$INBOUND_HOST"; then
+    log_error "Invalid INBOUND_HOST: '${INBOUND_HOST}' (must be a valid IPv4 or DNS hostname)."
+    exit 1
 fi
 
 # Record preexisting config BEFORE Step 2 installer runs (upstream installer creates empty {})
@@ -489,21 +562,20 @@ fi
 log_info "Reality credentials prepared (reused=${REUSED_CREDENTIALS})."
 
 # ------------------------------------------------------------------------------
-# 4. Kernel Tuning (with Persistent + Live Runtime Rollback Snapshot)
+# 4. Kernel Tuning (with Persistent + Per-Interface Live Runtime Rollback Snapshot)
 # ------------------------------------------------------------------------------
 SYSCTL_BACKUP=""
 SYSCTL_MODIFIED=false
-SYSCTL_KEYS=(
-    "net.ipv6.conf.all.disable_ipv6"
-    "net.ipv6.conf.default.disable_ipv6"
-    "net.ipv6.conf.lo.disable_ipv6"
+SYSCTL_BASE_KEYS=(
     "net.ipv4.tcp_keepalive_time"
     "net.ipv4.tcp_keepalive_intvl"
     "net.ipv4.tcp_keepalive_probes"
     "net.core.default_qdisc"
     "net.ipv4.tcp_congestion_control"
 )
-SYSCTL_SAVED_PAIRS=()
+SYSCTL_SAVED_GLOBAL_IPV6=()
+SYSCTL_SAVED_IFACE_IPV6=()
+SYSCTL_SAVED_BASE_PAIRS=()
 
 rollback_sysctl() {
     if [ "$SYSCTL_MODIFIED" = "true" ]; then
@@ -513,24 +585,58 @@ rollback_sysctl() {
             rm -f "$SYSCTL_FILE" || true
         fi
         sysctl --system >/dev/null 2>&1 || true
-        # Explicitly restore pre-run live kernel runtime values (sysctl --system alone
-        # does not reset keys absent from other /etc/sysctl.d files!)
+        # Restore order matters on Linux:
+        # 1. Restore all/default disable_ipv6 FIRST (writing all.disable_ipv6 propagates to interfaces)
+        # 2. Then restore every specific interface's original disable_ipv6 (lo, eth0, ens3, ...)
+        # 3. Restore non-IPv6 TCP keepalive & congestion control values
         local pair
-        for pair in "${SYSCTL_SAVED_PAIRS[@]}"; do
+        for pair in "${SYSCTL_SAVED_GLOBAL_IPV6[@]}"; do
+            sysctl -w "$pair" >/dev/null 2>&1 || true
+        done
+        for pair in "${SYSCTL_SAVED_IFACE_IPV6[@]}"; do
+            sysctl -w "$pair" >/dev/null 2>&1 || true
+        done
+        for pair in "${SYSCTL_SAVED_BASE_PAIRS[@]}"; do
             sysctl -w "$pair" >/dev/null 2>&1 || true
         done
         SYSCTL_MODIFIED=false
-        log_warn "Rolled back sysctl file (${SYSCTL_FILE}) and restored pre-run live kernel values."
+        log_warn "Rolled back sysctl file (${SYSCTL_FILE}) and restored per-interface & live kernel values."
     fi
 }
 
 if [ "$SKIP_SYSCTL" != "true" ]; then
     log_info "Step 4: Tuning Linux Kernel parameters (Anti-leak & Keepalive)..."
-    # Snapshot live runtime values before mutating
-    for _k in "${SYSCTL_KEYS[@]}"; do
+    # Snapshot ALL per-interface net.ipv6.conf.*.disable_ipv6 values (all, default, lo, eth0, ens3, ...)
+    while IFS= read -r _line; do
+        [ -z "$_line" ] && continue
+        _k=$(printf '%s' "$_line" | cut -d'=' -f1 | tr -d ' \t')
+        _v=$(printf '%s' "$_line" | cut -d'=' -f2- | tr -d ' \t\r')
+        [ -z "$_k" ] || [ -z "$_v" ] && continue
+        case "$_k" in
+            net.ipv6.conf.all.disable_ipv6|net.ipv6.conf.default.disable_ipv6)
+                SYSCTL_SAVED_GLOBAL_IPV6+=("${_k}=${_v}")
+                ;;
+            net.ipv6.conf.*.disable_ipv6)
+                SYSCTL_SAVED_IFACE_IPV6+=("${_k}=${_v}")
+                ;;
+        esac
+    done < <(sysctl net.ipv6.conf 2>/dev/null | grep -E '^net\.ipv6\.conf\.[^[:space:]]+\.disable_ipv6[[:space:]]*=' || true)
+
+    # Fallback if sysctl net.ipv6.conf returned nothing: snapshot all/default/lo via sysctl -n
+    if [ "${#SYSCTL_SAVED_GLOBAL_IPV6[@]}" -eq 0 ] && [ "${#SYSCTL_SAVED_IFACE_IPV6[@]}" -eq 0 ]; then
+        for _k in net.ipv6.conf.all.disable_ipv6 net.ipv6.conf.default.disable_ipv6; do
+            _v=$(sysctl -n "$_k" 2>/dev/null || true)
+            [ -n "$_v" ] && SYSCTL_SAVED_GLOBAL_IPV6+=("${_k}=${_v}")
+        done
+        _v=$(sysctl -n net.ipv6.conf.lo.disable_ipv6 2>/dev/null || true)
+        [ -n "$_v" ] && SYSCTL_SAVED_IFACE_IPV6+=("net.ipv6.conf.lo.disable_ipv6=${_v}")
+    fi
+
+    # Snapshot non-IPv6 live runtime values
+    for _k in "${SYSCTL_BASE_KEYS[@]}"; do
         _v=$(sysctl -n "$_k" 2>/dev/null || true)
         if [ -n "$_v" ]; then
-            SYSCTL_SAVED_PAIRS+=("${_k}=${_v}")
+            SYSCTL_SAVED_BASE_PAIRS+=("${_k}=${_v}")
         fi
     done
 
@@ -600,10 +706,6 @@ if [ "$WARP_READY" != "true" ]; then
 else
     log_info "Cloudflare WARP proxy verified active on 127.0.0.1:${WARP_PORT} (Dual-track enabled)."
 fi
-
-# Determine outbound egress IP vs. external client-facing inbound host (supports NAT VPS)
-EGRESS_IP="${EGRESS_IP_INPUT:-$(curl -s -4 -m 5 https://api.ipify.org || curl -s -4 -m 5 https://ipinfo.io/ip || curl -s -4 -m 5 https://icanhazip.com || echo "YOUR_VPS_IP")}"
-INBOUND_HOST="${INBOUND_HOST_INPUT:-${EGRESS_IP}}"
 
 # ------------------------------------------------------------------------------
 # 6. Build & Validate Candidate Xray Configuration (Least-Privilege Permissions)
@@ -821,6 +923,8 @@ log_info "Configuration validation passed."
 FIREWALL_STATUS="none_detected"
 FIREWALL_RULE_ADDED=false
 FIREWALL_BACKEND=""
+FWD_ADDED_PERM=false
+FWD_ADDED_RUNTIME=false
 
 rollback_firewall() {
     if [ "$FIREWALL_RULE_ADDED" != "true" ]; then
@@ -831,8 +935,14 @@ rollback_firewall() {
             ufw --force delete allow "${PORT}/tcp" >/dev/null 2>&1 || true
             ;;
         firewalld)
-            firewall-cmd --permanent --remove-port="${PORT}/tcp" >/dev/null 2>&1 || true
-            firewall-cmd --reload >/dev/null 2>&1 || true
+            if [ "$FWD_ADDED_PERM" = "true" ]; then
+                firewall-cmd --permanent --remove-port="${PORT}/tcp" >/dev/null 2>&1 || true
+                FWD_ADDED_PERM=false
+            fi
+            if [ "$FWD_ADDED_RUNTIME" = "true" ]; then
+                firewall-cmd --remove-port="${PORT}/tcp" >/dev/null 2>&1 || true
+                FWD_ADDED_RUNTIME=false
+            fi
             ;;
         iptables)
             iptables -D INPUT -p tcp --dport "${PORT}" -j ACCEPT >/dev/null 2>&1 || true
@@ -875,16 +985,33 @@ if command -v ufw >/dev/null 2>&1 && ufw status 2>/dev/null | grep -q "Status: a
     log_info "Confirmed: UFW allowed TCP port ${PORT}."
 elif command -v firewall-cmd >/dev/null 2>&1 && firewall-cmd --state >/dev/null 2>&1; then
     log_info "Step 7: Active firewalld detected; allowing TCP port ${PORT}..."
-    FWD_PREEXISTING=false
-    if firewall-cmd --query-port="${PORT}/tcp" >/dev/null 2>&1; then
-        FWD_PREEXISTING=true
+    # Independently check permanent vs runtime rules so rollback ONLY undoes what WE added!
+    FWD_HAD_PERM=false
+    FWD_HAD_RUNTIME=false
+    if firewall-cmd --permanent --query-port="${PORT}/tcp" >/dev/null 2>&1; then
+        FWD_HAD_PERM=true
     fi
-    if [ "$FWD_PREEXISTING" != "true" ]; then
-        if ! firewall-cmd --permanent --add-port="${PORT}/tcp" || ! firewall-cmd --reload; then
-            log_error "FAILED to allow port ${PORT}/tcp in firewalld! Rolling back before touching active config.json."
+    if firewall-cmd --query-port="${PORT}/tcp" >/dev/null 2>&1; then
+        FWD_HAD_RUNTIME=true
+    fi
+    if [ "$FWD_HAD_PERM" != "true" ]; then
+        if ! firewall-cmd --permanent --add-port="${PORT}/tcp"; then
+            log_error "FAILED to add permanent port ${PORT}/tcp in firewalld! Rolling back before touching active config.json."
             rollback_pre_deploy
             exit 1
         fi
+        # Record immediately BEFORE reload so a failed reload still rolls back the permanent rule!
+        FWD_ADDED_PERM=true
+        FIREWALL_RULE_ADDED=true
+        FIREWALL_BACKEND="firewalld"
+    fi
+    if [ "$FWD_HAD_RUNTIME" != "true" ]; then
+        if ! firewall-cmd --reload; then
+            log_error "FAILED to reload firewalld after configuring port ${PORT}/tcp! Rolling back newly added rules."
+            rollback_pre_deploy
+            exit 1
+        fi
+        FWD_ADDED_RUNTIME=true
         FIREWALL_RULE_ADDED=true
         FIREWALL_BACKEND="firewalld"
     fi

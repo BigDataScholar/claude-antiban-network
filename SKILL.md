@@ -80,16 +80,16 @@ flowchart TD
 
 #### 模式 A：直接以 `root` 登录的 VPS
 ```bash
-# 1. 创建仅当前用户可访问的私有 0700 暂存目录
-REMOTE_STAGE=$(ssh -p <SSH_PORT> root@<VPS_IP> 'umask 077 && mktemp -d "$HOME/.claude-antiban-stage.XXXXXX"')
-
-# 2. 上传脚本并确认上传成功后再执行（默认仅允许全新 VPS；不向终端吐出敏感凭证）
+# 1. 创建私有 0700 暂存目录并严格校验返回路径，确认有效后才上传并执行（避免失败时误传到 /vps_setup.sh）
+REMOTE_STAGE=$(ssh -p <SSH_PORT> root@<VPS_IP> 'umask 077 && mktemp -d "$HOME/.claude-antiban-stage.XXXXXX"') && \
+case "$REMOTE_STAGE" in
+  /*/.claude-antiban-stage.*) ;;
+  *) echo "[ERROR] Invalid or empty REMOTE_STAGE: '$REMOTE_STAGE'" >&2; exit 1 ;;
+esac && \
 scp -P <SSH_PORT> <skill-path>/scripts/vps_setup.sh "root@<VPS_IP>:${REMOTE_STAGE}/vps_setup.sh" && \
 ssh -p <SSH_PORT> root@<VPS_IP> \
-  "test -s '${REMOTE_STAGE}/vps_setup.sh' && OUTPUT_FILE='${REMOTE_STAGE}/node.json' bash '${REMOTE_STAGE}/vps_setup.sh'"
-
-# 3. 拉取 0600 节点元数据到本地受限目录，并立即清理远端暂存目录
-mkdir -p -m 700 ~/.claude-antiban
+  "test -s '${REMOTE_STAGE}/vps_setup.sh' && OUTPUT_FILE='${REMOTE_STAGE}/node.json' bash '${REMOTE_STAGE}/vps_setup.sh'" && \
+mkdir -p -m 700 ~/.claude-antiban && \
 scp -P <SSH_PORT> "root@<VPS_IP>:${REMOTE_STAGE}/node.json" ~/.claude-antiban/node.json && \
 chmod 600 ~/.claude-antiban/node.json && \
 ssh -p <SSH_PORT> root@<VPS_IP> "rm -f '${REMOTE_STAGE}/vps_setup.sh' '${REMOTE_STAGE}/node.json' && rmdir '${REMOTE_STAGE}'"
@@ -97,20 +97,20 @@ ssh -p <SSH_PORT> root@<VPS_IP> "rm -f '${REMOTE_STAGE}/vps_setup.sh' '${REMOTE_
 
 #### 模式 B：普通用户 + `sudo` 登录的 VPS（如 AWS / GCP / Azure 的 `ubuntu` / `debian`）
 ```bash
-# 1. 在当前 SSH 用户主目录下创建私有 0700 暂存目录（杜绝共享 /tmp 竞态风险）
-REMOTE_STAGE=$(ssh -p <SSH_PORT> <SSH_USER>@<VPS_IP> 'umask 077 && mktemp -d "$HOME/.claude-antiban-stage.XXXXXX"')
-
-# 2. 上传脚本并确认本次上传成功后再以 sudo 执行，节点元数据写入同一私有 0700 目录
+# 1. 创建私有 0700 暂存目录并校验路径有效后，再上传、提权执行、拉取并清理（杜绝共享 /tmp 与空路径误传）
+REMOTE_STAGE=$(ssh -p <SSH_PORT> <SSH_USER>@<VPS_IP> 'umask 077 && mktemp -d "$HOME/.claude-antiban-stage.XXXXXX"') && \
+case "$REMOTE_STAGE" in
+  /*/.claude-antiban-stage.*) ;;
+  *) echo "[ERROR] Invalid or empty REMOTE_STAGE: '$REMOTE_STAGE'" >&2; exit 1 ;;
+esac && \
 scp -P <SSH_PORT> <skill-path>/scripts/vps_setup.sh "<SSH_USER>@<VPS_IP>:${REMOTE_STAGE}/vps_setup.sh" && \
 ssh -p <SSH_PORT> <SSH_USER>@<VPS_IP> \
-  "test -s '${REMOTE_STAGE}/vps_setup.sh' && chmod 700 '${REMOTE_STAGE}/vps_setup.sh' && sudo OUTPUT_FILE='${REMOTE_STAGE}/node.json' OUTPUT_OWNER=\"\$USER\" bash '${REMOTE_STAGE}/vps_setup.sh'"
-# 注：若远端 sudo 需要输入密码，请引导用户在自己本机终端加 `ssh -t` 执行，勿在聊天收集密码
-
-# 3. 通过 scp 拉取 0600 元数据文件，并立即清理远端暂存目录
-mkdir -p -m 700 ~/.claude-antiban
+  "test -s '${REMOTE_STAGE}/vps_setup.sh' && chmod 700 '${REMOTE_STAGE}/vps_setup.sh' && sudo OUTPUT_FILE='${REMOTE_STAGE}/node.json' OUTPUT_OWNER=\"\$USER\" bash '${REMOTE_STAGE}/vps_setup.sh'" && \
+mkdir -p -m 700 ~/.claude-antiban && \
 scp -P <SSH_PORT> "<SSH_USER>@<VPS_IP>:${REMOTE_STAGE}/node.json" ~/.claude-antiban/node.json && \
 chmod 600 ~/.claude-antiban/node.json && \
 ssh -p <SSH_PORT> <SSH_USER>@<VPS_IP> "rm -f '${REMOTE_STAGE}/vps_setup.sh' '${REMOTE_STAGE}/node.json' && rmdir '${REMOTE_STAGE}'"
+# 注：若远端 sudo 需要输入密码，请引导用户在自己本机终端将执行段加 `ssh -t` 运行，勿在聊天收集密码
 ```
 
 * **NAT VPS（对外入口地址/端口与本机监听端口或出口 IP 不同）**：

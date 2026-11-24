@@ -12,10 +12,31 @@ Security & correctness features:
 """
 
 import argparse
+import ipaddress
 import json
 import os
+import re
 import sys
 import urllib.parse
+
+HOSTNAME_RE = re.compile(
+    r"^[A-Za-z0-9](?:[A-Za-z0-9-]{0,61}[A-Za-z0-9])?"
+    r"(?:\.[A-Za-z0-9](?:[A-Za-z0-9-]{0,61}[A-Za-z0-9])?)*$"
+)
+PLACEHOLDER_HOSTS = {"YOUR_VPS_IP", "VPS_IP", "<VPS_IP>", "EXAMPLE_IP"}
+
+
+def is_valid_server_host(host):
+    if not isinstance(host, str):
+        return False
+    h = host.strip()
+    if not h or h != host or h.upper() in PLACEHOLDER_HOSTS or "<" in h or ">" in h:
+        return False
+    try:
+        ipaddress.ip_address(h)
+        return True
+    except ValueError:
+        return bool(HOSTNAME_RE.match(h))
 
 TEMPLATE_YAML = """port: 7890
 socks-port: 7891
@@ -287,6 +308,22 @@ def main():
             file=sys.stderr,
         )
         sys.exit(1)
+
+    if not is_valid_server_host(str(server_ip)):
+        print(
+            f"[ERROR] Invalid or placeholder server address: {server_ip!r}. Provide a valid IP address or hostname.",
+            file=sys.stderr,
+        )
+        sys.exit(1)
+
+    try:
+        port_int = int(port)
+        if not (1 <= port_int <= 65535):
+            raise ValueError("out of range")
+    except (TypeError, ValueError):
+        print(f"[ERROR] Invalid TCP port: {port!r} (must be 1..65535).", file=sys.stderr)
+        sys.exit(1)
+    port = port_int
 
     output_path = os.path.expanduser(args.output)
     if args.vless_output:
